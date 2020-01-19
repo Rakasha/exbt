@@ -1,5 +1,5 @@
 # exbt
-
+This script is still in beta.
 
 Naive implementation of BitTorrent Client (in Elixir), quick and dirty.
 

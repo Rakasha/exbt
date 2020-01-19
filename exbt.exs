@@ -2531,6 +2531,1000 @@ defmodule Job do
     end
 end
 
+defmodule DHTBucket do
+    require Logger
+    defstruct [
+      :capacity, :nodes, :last_changed, :candidates
+    ]
+
+    def new_bucket(capacity) do
+      # Create an empty bucket
+      %DHTBucket{
+        capacity: capacity,
+        last_changed: System.system_time(:second),
+        nodes: [],
+        candidates: [],
+      }
+    end
+
+    def add_node(bucket, node) do
+      # Add node to bucket if its not in nodes or candidates
+      # -> {:ok, bucket} or {:error, :bucket_full}
+      cond do
+        has_node?(bucket, node.id) ->
+          updated_bucket = refresh_node(bucket, node.id)
+          {:ok, updated_bucket}
+        has_candidate?(bucket, node.id) ->
+          {:ok, bucket}
+        is_full?(bucket) ->
+          {:error, :bucket_full}
+        true ->
+          updated_nodes = insert_to_sorted_nodes(node, bucket.nodes)
+          updated_bucket = %{bucket | nodes: updated_nodes}
+          {:ok, updated_bucket}
+      end
+    end
+
+    def add_candidate(bucket, node) do
+      Logger.debug("Add candidate #{inspect node} to bucket #{inspect bucket}")
+      cands = List.insert_at(bucket.candidates, -1, node)
+      %{bucket | candidates: cands}
+    end
+
+    def delete_node(bucket, node_id) do
+      # delete node, also add one from candidate
+      buck = without_node(bucket, node_id)
+      case buck.candidates do
+        [] ->
+          buck
+        [x|_] ->
+          {:ok, buck2} = DHTBucket.add_node(buck, x)
+          buck2
+      end
+    end
+
+    def get_node_by_id(bucket, node_id) do
+      # -> Node or nil
+      Enum.find(bucket.nodes, fn x -> x.id == node_id end)
+    end
+
+    def get_nodes(bucket) do
+      bucket.nodes
+    end
+
+    def get_n_nodes(bucket, n) do
+      Enum.take(bucket.nodes, n)
+    end
+
+    def has_node?(bucket, node_id) do
+      if get_node_by_id(bucket, node_id) == nil do
+        false
+      else
+        true
+      end
+    end
+
+    def has_candidate?(bucket, node_id) do
+      a = Enum.find(bucket.candidates, fn x -> x.id == node_id end)
+      if a == nil do
+        false
+      else
+        true
+      end
+    end
+
+    def without_node(bucket, node_id) do
+      new_nodes = Enum.reject(bucket.nodes, fn x -> x.id == node_id end)
+      %{bucket | nodes: new_nodes}
+    end
+
+    def get_most_trusty_node(bucket) do
+      # -> {node_id, node_data} or nil
+      get_trusty_nodes(bucket) |> List.first
+    end
+
+    def get_trusty_nodes(bucket) do
+      # -> list of {node_id, node_data}
+      now = System.os_time(:second)
+      Enum.filter(bucket.nodes,
+        fn x ->
+          now - x.last_active <= healthcheck_threshold()
+        end)
+    end
+
+    def get_most_questionable_node(bucket) do
+      # -> {node_id, node_data} or nil
+      get_questionable_nodes(bucket) |> List.last
+    end
+
+    def get_questionable_nodes(bucket) do
+      # -> list of {node_id, node_data}
+      now = System.os_time(:second)
+      Enum.filter(bucket.nodes,
+                  fn x ->
+                    now - x.last_active > healthcheck_threshold()
+                  end)
+    end
+
+    def size(bucket) do
+      {current_size, _max_size} = size_info(bucket)
+      current_size
+    end
+
+    def size_info(bucket) do
+      current_size = length(bucket.nodes)
+      max_size = bucket.capacity
+      {current_size, max_size}
+    end
+
+    def is_full?(bucket) do
+      {current_size, max_size} = size_info(bucket)
+      current_size == max_size
+    end
+
+    def is_fresh?(bucket) do
+      System.system_time(:second) - bucket.last_changed <= 60 * 5
+    end
+
+    def refresh_node(bucket, node_id) do
+      idx = Enum.find_index(bucket.nodes, fn x -> x.id == node_id end)
+      {node, nodes} = List.pop_at(bucket.nodes, idx)
+      refreshed_node = %{node | last_active: System.system_time(:second)}
+      %{bucket | nodes: insert_to_sorted_nodes(refreshed_node, nodes)}
+    end
+
+    def insert_to_sorted_nodes(new_node, sorted_nodes) do
+      # returned a list of sorted-nodes,
+      # which first element has the most recent active_time
+      case sorted_nodes do
+        [] -> [new_node]
+        [x | rest] ->
+          if new_node.last_active > x.last_active do
+            [new_node| sorted_nodes]
+          else
+            [x| insert_to_sorted_nodes(new_node, rest)]
+          end
+      end
+    end
+
+    def healthcheck_threshold() do
+      # 15 minutes
+      15 * 60
+    end
+
+  end
+
+
+  defmodule DHTTable do
+    require Logger
+    defstruct [
+      buckets: [],
+      reference_node_id: nil
+    ]
+
+    def new_table(reference_node_id, bucket_capacity \\ 20) when is_bitstring(reference_node_id) do
+      # Use the bit_size of node_id to determine the space of table
+      num_of_buckets = bit_size(reference_node_id)
+      buckets = for _ <- 0..num_of_buckets do
+        DHTBucket.new_bucket(bucket_capacity)
+      end
+
+      %DHTTable{
+        buckets: buckets,
+        reference_node_id: reference_node_id,
+      }
+    end
+
+    def get_node(table, node_id) do
+      bucket = get_corresponding_bucket(table, node_id)
+      Logger.warn("get_node:  #{inspect node_id} try bucket #{inspect bucket}")
+      DHTBucket.get_node_by_id(bucket, node_id)
+    end
+
+    def reference_node_id(table) do
+      table.reference_node_id
+    end
+
+    def get_k_nearest_nodes(table, node_id, k \\ 8) do
+      distance = DHTUtils.node_distance_binary(table.reference_node_id, node_id)
+      bucket = get_bucket_by_distance(table, distance)
+      DHTBucket.get_n_nodes(bucket, k)
+    end
+
+    def get_bucket_by_distance(table, distance) when is_bitstring(distance) do
+      i = get_bucket_num_by_distance(distance)
+      Enum.fetch!(table.buckets, i)
+    end
+
+    def get_bucket_num_by_distance(distance) when is_bitstring(distance) do
+      prefix_len = DHTUtils.count_0_prefix_length(distance)
+      # 0101 -> prefix_len 1 -> bucket (4-1)=3
+      # 0001 -> prefix_len 3 -> bucket (4-3)=1
+      # 0000 -> prefix_len 4 -> bucket (4-4)=0 (reference_node)
+      bucket_id = bit_size(distance) - prefix_len
+      bucket_id
+    end
+    def get_corresponding_bucket(table, node_id) do
+      distance = DHTUtils.node_distance_binary(table.reference_node_id, node_id)
+      get_bucket_by_distance(table, distance)
+    end
+
+    def get_corresopnding_bucket_num(table, node_id) do
+      dist = DHTUtilds.node_distance_binary(table.reference_node_id, node_id)
+      get_bucket_num_by_distance(dist)
+    end
+
+    def size(table) do
+      # Return number of buckets
+      length(table.buckets)
+    end
+  end
+
+
+  defmodule DHTUtils do
+    require Logger
+    def count_0_prefix_length(n) when is_bitstring(n) do
+      count_0_prefix_length(n, 0)
+    end
+    defp count_0_prefix_length(n, acc) when is_bitstring(n) do
+      case n do
+        <<>> -> acc
+        <<1::1, _rest::bitstring>> -> acc
+        <<0::1, rest::bitstring>>  -> count_0_prefix_length(rest, acc+1)
+      end
+    end
+
+    def node_distance_binary(node_id_1, node_id_2) do
+      # Calculate the node distance with XOR and return in binary format
+      :crypto.exor(node_id_1, node_id_2)
+    end
+
+    def gen_random_bitstring(number_of_bits) do
+      # Generates a length-n randomized bitstring
+      num_bytes = :erlang.ceil(number_of_bits/8)
+      rand_bytes = :crypto.strong_rand_bytes(num_bytes)
+      <<data::size(number_of_bits)-bits, _::bits>> = rand_bytes
+      data
+    end
+
+    def gen_random_string(string_length) do
+      gen_random_bitstring(8*string_length)
+        |> Base.url_encode64 |>binary_part(0, string_length)
+    end
+
+    def gen_node_id() do
+      gen_random_string(20)
+    end
+
+    def parse_peers_val(vals) when is_list(vals) do
+      # Just make sure its parsable
+      Enum.each(vals, fn x ->
+        <<a, b, c, d, port::16>> = x
+        ip = {a, b, c, d}
+        {ip, port}
+      end)
+      # Returns the origianl values (list of string)
+      vals
+    end
+
+    def parse_nodes_val(bin) when is_binary(bin) do
+      case bin do
+        <<"">> -> []
+        <<x::208-bits, rest::binary>> ->
+          node = DHTNode.from_compact_info(x)
+          [node | parse_nodes_val(rest)]
+      end
+    end
+
+    def get_magnet_info_hash(url) do
+      # -> {:ok, <info_hash>} or {:error, reason}
+      r = URI.parse(url)
+      if r.scheme != "magnet" do
+        {:error, :invalid_magnet_schema}
+      else
+        params = URI.query_decoder(r.query) |> Enum.to_list
+        xt_pair = List.keyfind(params, "xt", 0)
+        case xt_pair do
+          {"xt", "urn:btih:" <> hex_encoded_info_hash} ->
+            case Base.decode16(hex_encoded_info_hash, case: :mixed) do
+              :error ->
+                {:error, :invalid_info_hash}
+              {:ok, info_hash} ->
+                {:ok, info_hash}
+            end
+          xt ->
+            {:error, {:invalid_xt, xt}}
+        end
+      end
+    end
+  end
+
+  defmodule DHTNode do
+    defstruct [
+      :id, :ip, :port, :last_active,
+    ]
+    def from_compact_info(bin) when is_binary(bin) do
+      <<node_id::160-bits, a, b, c, d, port::16>> = bin
+      ip = {a, b, c, d}
+      %DHTNode{id: node_id, ip: ip, port: port}
+    end
+
+    def compact_info(node) do
+      node.id <> contact_info(node)
+    end
+
+    def contact_info(node) do
+      {a,b,c,d} = node.ip
+      <<a, b, c, d>> <> <<node.port::integer-size(16)>>
+    end
+  end
+
+  defmodule KRPC_Msg do
+    require Logger
+    # http://www.bittorrent.org/beps/bep_0005.html
+    # Use Records for message struct instead of pure Maps
+
+    def get_error_types() do
+      %{
+        generic_error:  201,
+        server_error:   202,
+        protocol_error: 203,
+        method_unknown: 204,
+      }
+    end
+
+    def get_sender_id(msg) do
+      # Extract the message sender's node_id.
+      # -> <<binary node_id>> | nil
+      case msg["y"] do
+        "q" -> msg["a"]["id"]
+        "r" -> msg["r"]["id"]
+        "e" -> nil
+      end
+    end
+
+    def error_code(error_type) do
+      Enum.fetch!(get_error_types(), error_type)
+    end
+
+    def to_bin(msg) when is_map(msg) do
+      Bencoding.encode(msg)
+    end
+
+    def from_bin(data) when is_binary(data) do
+      {:ok, {msg, <<"">>}} = from_buffer(data)
+      msg
+    end
+
+    def from_buffer(buffer) when is_binary(buffer) do
+      try do
+        {msg, rest_buff} = Bencoding.decode_prefix_dict(buffer, %{decode_string_as: :ascii})
+        Logger.debug("[KRPC_Msg.from_buffer] Got msg #{inspect msg}")
+        {:ok, {msg, rest_buff}}
+      rescue
+        _e ->
+          # TODO: Do not catch all excpetions
+          {:error, :invalid_format}
+      end
+    end
+
+    def ping(sender_id) do
+      # ping Query = {"t":"aa", "y":"q", "q":"ping", "a":{"id":"abcdefghij0123456789"}}
+      # bencoded = d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe
+      # Response = {"t":"aa", "y":"r", "r": {"id":"mnopqrstuvwxyz123456"}}
+      # bencoded = d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re
+      query_args = %{"id" => sender_id}
+      %{"t" => gen_transaction_id(),
+        "y" => "q", "q" => "ping", "a" => query_args}
+    end
+
+    def find_node(sender_id, target_node_id) do
+      query_args = %{"id" => sender_id, "target" => target_node_id}
+      %{"t" => gen_transaction_id(),
+        "y" => "q", "q" => "find_node", "a" => query_args}
+    end
+
+
+    def get_peers(sender_id, torrent_info_hash) do
+      query_args = %{"id" => sender_id, "info_hash" => torrent_info_hash}
+      %{"t" => gen_transaction_id(),
+        "y" => "q", "q" => "get_peers", "a" => query_args}
+    end
+
+    def announce_peer(sender_id, torrent_info_hash, token, port, implied_port \\ 0) do
+      query_args = %{ "id" => sender_id,
+                      "implied_port" => implied_port,
+                      "info_hash" => torrent_info_hash,
+                      "port" => port,
+                      "token" => token}
+      %{"t" => gen_transaction_id(),
+        "y" => "q", "q" => "announce_peer", "a" => query_args}
+    end
+
+    def error(transaction_id, error_code, error_msg) do
+      if error_code not in Enum.values(get_error_types()) do
+          raise "Unknown error_code: #{error_code}"
+      end
+
+      %{"t" => transaction_id,
+        "y" => "e",
+        "e" => [error_code, error_msg]}
+    end
+
+    def response(sender_id, transaction_id, response_data) do
+      %{"t" => transaction_id,
+        "y" => "r",
+        # Include the queried node's ID
+        "r" => Map.put(response_data, "id", sender_id)}
+    end
+
+    def gen_transaction_id do
+      # The transaction ID should be encoded as a short string of binary numbers,
+      # typically 2 characters are enough as they cover 2^16 outstanding queries.
+      :crypto.strong_rand_bytes(2) |> Base.url_encode64 |> binary_part(0,2)
+    end
+
+  end
+
+
+  defmodule TokenServer do
+    # Provodes tokens for the KRPC's secret_length/announce_peer methods
+    use GenServer
+
+    @token_expire_time 5*60*1000
+    @secret_length 8
+
+    defstruct [
+      :secret,
+      :old_secret,
+    ]
+
+    def start_link(init_args, debug \\ false) do
+      opts = if debug == true do
+        [debug: [:statistics, :trace]]
+      else
+        []
+      end
+      GenServer.start_link(__MODULE__, init_args, opts)
+    end
+
+    def init([]) do
+      state = %TokenServer{secret:     random_secret(),
+                           old_secret: random_secret(),}
+      {:ok, state}
+    end
+
+    def is_valid_token?(pid, ip, token) do
+      GenServer.call(pid, {:is_valid_token, ip, token})
+    end
+
+    def request_token(pid, ip) do
+      GenServer.call(pid, {:request_token, ip})
+    end
+
+    def random_secret() do
+      :crypto.strong_rand_bytes(@secret_length)
+    end
+
+    def calculate_token(ip, secret) do
+      {a, b, c, d} = ip
+      data = <<a, b, c, d>> <> secret
+      :crypto.hash(:sha, data) |> Base.encode16 |> String.downcase
+    end
+
+    def handle_call({:is_valid_token, ip, token}, _from, state) do
+      is_valid = (token == calculate_token(ip, state.secret)) or
+                 (token == calculate_token(ip, state.old_secret))
+      {:reply, is_valid, state}
+    end
+
+    def handle_call({:request_token, ip}, _from, state) do
+      token = calculate_token(ip, state.secret)
+      {:reply, token, state}
+    end
+
+    def handle_info(:loop_renew_secret, state) do
+      new_state = %{state |
+                      old_secret: state.secret,
+                      secret: random_secret()}
+      Process.send_after(self(), :loop_renew_secret, @token_expire_time)
+      {:noreply, new_state}
+    end
+
+  end
+
+  defmodule DHTServer do
+    use GenServer
+    require Logger
+    @ping_response_threshold_sec 30
+    @krpc_query_timeout 6000
+    @api_general_timeout 8000
+    @api_search_nodes_timeout 30000
+
+    defstruct [
+      :node_id, :table, :peer_info, :token_server,
+      :socket, :waiting_response,
+    ]
+
+    def start(init_args, debug \\ false) do
+      opts = if debug == true do
+        [debug: [:statistics, :trace]]
+      else
+        []
+      end
+      GenServer.start(__MODULE__, init_args, opts)
+    end
+    def start_link(init_args, debug \\ false) do
+      opts = if debug == true do
+        [debug: [:statistics, :trace]]
+      else
+        []
+      end
+      GenServer.start_link(__MODULE__, init_args, opts)
+    end
+
+    def init([node_id, port]) do
+
+      {:ok, socket} = :gen_udp.open(port, [:binary, :inet, {:active, true}])
+      {:ok, token_server_pid} = TokenServer.start_link([])
+      state = %DHTServer{node_id: node_id,
+                         table:  DHTTable.new_table(node_id),
+                         peer_info:  %{},
+                         token_server: token_server_pid,
+                         waiting_response: %{},
+                         socket: socket,
+                        }
+      {:ok, state}
+    end
+
+    def ping(pid, node_id) do
+      # -> :ok | {:error, :response_timeout}
+      GenServer.call(pid, {:ping, node_id}, @api_general_timeout)
+    end
+
+    def find_node(pid, node_id, receiver_node_id) do
+      # -> <node_list> or {:error, :response_timeout}
+      GenServer.call(pid, {:find_node, node_id, receiver_node_id}, @api_general_timeout)
+    end
+    def find_node(pid, node_id, receiver_ip, receiver_port) do
+      GenServer.call(pid, {:find_node, node_id, receiver_ip, receiver_port}, @api_general_timeout)
+    end
+
+    def get_peers(pid, info_hash, receiver_ip, receiver_port) do
+      # ->  {:peers, <peer_list>}
+      #  or {:nodes, <node_list>}
+      #  or {:error, :response_timeout}
+      GenServer.call(pid, {:get_peers, info_hash, receiver_ip, receiver_port}, @api_general_timeout)
+    end
+
+    def node_id(pid) do
+      GenServer.call(pid, :node_id)
+    end
+
+    def search_peers(pid, info_hash) do
+      neighbor_nodes = GenServer.call(pid, {:stored_nearest_nodes, info_hash})
+      Logger.debug("[search_peers] picked neighbor_nodes #{inspect neighbor_nodes}")
+      acc = {neighbor_nodes, [], []}
+      search_peers(pid, info_hash, acc)
+    end
+    def search_peers(pid, info_hash, acc) do
+      {neighbor_nodes, searched_ids, acc_peers} = acc
+      nodes_to_search = Enum.filter(Enum.take(neighbor_nodes, 3),
+                                    fn x -> x.id not in searched_ids end)
+      if nodes_to_search == [] do
+        acc_peers
+      else
+        {new_nodes, new_peers} =
+          Task.async_stream(nodes_to_search,
+                            fn x ->
+                              GenServer.call(pid, {:get_peers, info_hash, x.ip, x.port}, :infinity)
+                            end, [{:timeout, @api_general_timeout}])
+          |> Enum.to_list
+          |> List.foldl({[], []},
+                        fn (x, {nodes, peers}=acc) ->
+                          case x do
+                            {:error, reason} ->
+                              Logger.warn("[search_peers] task error: #{inspect reason}")
+                              acc
+                            {:exit, reason} ->
+                              Logger.warn("[search_peers] task exit: #{inspect reason}")
+                              acc
+                            {:ok, {:error, reason}} ->
+                              Logger.warn("[search_peers] krpc error: #{inspect reason}")
+                              acc
+                            {:ok, {:nodes, ns}} ->
+                              {nodes ++ ns, peers}
+                            {:ok, {:peers, ps}} ->
+                              {nodes, peers ++ ps}
+                          end
+                        end)
+
+        neighbor_nodes2 = (new_nodes ++ neighbor_nodes)
+                          |> Enum.uniq_by(fn x -> x.id end)
+                          |> Enum.sort_by(fn x -> DHTUtils.node_distance_binary(info_hash, x.id) end)
+        searched_ids2 = searched_ids ++ Enum.map(nodes_to_search, fn x -> x.id end)
+        acc2 = {neighbor_nodes2, searched_ids2, acc_peers ++ new_peers}
+        search_peers(pid, info_hash, acc2)
+      end
+    end
+
+    def search_nodes(pid, target_node_id) do
+      # returns a list of close nodes
+      neighbor_nodes = GenServer.call(pid, {:stored_nearest_nodes, target_node_id})
+      Logger.debug("[search_nodes] picked neighbor_nodes #{inspect neighbor_nodes}")
+      acc = {neighbor_nodes, []}
+      search_nodes(pid, target_node_id, acc)
+    end
+    def search_nodes(pid, target_node_id, acc) do
+      {neighbor_nodes, searched_ids} = acc
+      nodes_to_search = Enum.filter(Enum.take(neighbor_nodes, 3),
+                                    fn x -> x.id not in searched_ids end)
+      if nodes_to_search == [] do
+        Enum.take(neighbor_nodes, 3)
+      else
+        new_nodes = Task.async_stream(nodes_to_search,
+                                      fn x ->
+                                        case find_node(pid, target_node_id, x.ip, x.port) do
+                                          {:error, :response_timeout} -> []
+                                          nodes -> nodes
+                                        end
+                                      end,
+                                      [{:timeout, @api_search_nodes_timeout}])
+                    |> Enum.to_list
+                    |> List.foldl([],
+                                  fn (x, acc) ->
+                                    case x do
+                                      {:ok, nodes} -> nodes ++ acc
+                                      _ -> acc
+                                    end
+                                  end)
+
+        # Enum.each(new_nodes, fn x -> add_node(pid) end)
+        Logger.debug("[search_nodes] new_nodes: #{inspect new_nodes}")
+        neighbor_nodes2 = (new_nodes ++ neighbor_nodes)
+                              |> Enum.uniq_by(fn x -> x.id end)
+                              |> Enum.sort_by(fn x -> DHTUtils.node_distance_binary(target_node_id, x.id) end)
+
+        searched_ids2 = searched_ids ++ Enum.map(nodes_to_search, fn x -> x.id end)
+        acc2 = {neighbor_nodes2, searched_ids2}
+        search_nodes(pid, target_node_id, acc2)
+      end
+    end
+
+    def schedule_node_check(pid, node_id) do
+      Process.send_after(pid, {:check_node_aliveness, node_id}, @ping_response_threshold_sec)
+    end
+
+    def handle_call(:state, _from, state) do
+      {:reply, state, state}
+    end
+
+    def handle_call(:node_id, _from, state) do
+      {:reply, state.table.reference_node_id, state}
+    end
+
+    def handle_call({:ping, node_id}, from, state) do
+      case DHTTable.get_node(state.table, node_id) do
+        nil ->
+          {:reply, {:error, :node_notfound}, state}
+        node ->
+          msg = KRPC_Msg.ping(state.node_id)
+          handle_call({:send_krpc_msg, node.ip, node.port, msg}, from, state)
+      end
+    end
+
+    def handle_call({:add_node, node_id, ip, port}, _from, state) do
+      new_state = do_add_node(node_id, ip, port, state)
+      {:reply, :ok, new_state}
+    end
+
+    def handle_call({:find_node, node_id, receiver_node_id}, from, state) do
+      # send a find_node query to <receiver_node_id>
+      case DHTTable.get_node(state.table, receiver_node_id) do
+        nil ->
+          {:reply, {:error, "unknown receiver_node_id", receiver_node_id}}
+        node ->
+          handle_call({:find_node, node_id, node.ip, node.port}, from, state)
+      end
+    end
+    def handle_call({:find_node, node_id, receiver_ip, receiver_port}, from, state) do
+      # send a find_node query to <receiver_node_id>
+      msg = KRPC_Msg.find_node(state.node_id, node_id)
+      handle_call({:send_krpc_msg, receiver_ip, receiver_port, msg}, from, state)
+    end
+
+    def handle_call({:get_peers, info_hash, receiver_ip, receiver_port}, from, state) do
+      msg = KRPC_Msg.get_peers(state.node_id, info_hash)
+      handle_call({:send_krpc_msg, receiver_ip, receiver_port, msg}, from, state)
+    end
+
+    def handle_call({:stored_nearest_nodes, node_id}, _from, state) do
+      # returns k-nearest nodes. sorted by distance (the closest first)
+      dist = DHTUtils.node_distance_binary(state.node_id, node_id)
+      nodes = DHTTable.get_k_nearest_nodes(state.table, dist)
+      sorted_nodes = Enum.sort_by(nodes, fn x -> DHTUtils.node_distance_binary(state.node_id, x.id) end)
+      {:reply, sorted_nodes, state}
+    end
+
+    def handle_call({:send_krpc_msg, ip, port, msg}, from, state) do
+      send_krpc_msg!(state.socket, ip, port, msg)
+      if msg["y"] == "q" do
+        # Save the query-msg for further checks
+        transaction_id = msg["t"]
+        waiting = Map.put(state.waiting_response, transaction_id, {msg, from})
+        new_state = %{state| waiting_response: waiting}
+        Process.send_after(self(), {:krpc_query_timeout, transaction_id}, @krpc_query_timeout)
+        # Suspend the :reply until we receives the query-response
+        {:noreply, new_state}
+      else
+        {:reply, :ok, state}
+      end
+    end
+
+    def handle_call(unknown_msg, _from, state) do
+      Logger.error("[DHTServer] Unknown handle_call msg: #{inspect unknown_msg}")
+      {:reply, :unknown_msg, state}
+    end
+
+    def handle_cast(:bootstrap, state) do
+      handle_cast({:bootstrap, {67, 215, 246, 10}, 6881}, state)
+    end
+    def handle_cast({:bootstrap, ip, port}, state) do
+      # Searches for a random node_id
+      random_target = DHTUtils.gen_node_id()
+      this = self()
+      Task.start_link(
+                fn ->
+                  case find_node(this, random_target, ip, port) do
+                    {:error, reason} ->
+                      Logger.error("[bootstrap] failed to find_node: #{inspect reason}")
+                    nodes ->
+                      Logger.info("[bootstrap] got nodes from bootstrap node: #{inspect nodes}")
+                      Enum.each(nodes, fn x -> GenServer.call(this, {:add_node, x.id, x.ip, x.port}, :infinity) end)
+                      res = search_nodes(this, random_target)
+                      Logger.info("[bootstrap] result: #{inspect res}")
+                  end
+                end)
+      {:noreply, state}
+    end
+
+    def handle_info({:udp, _socket, ip, port, raw}, state) do
+      Logger.debug("[udp] #{inspect ip}:#{port} >>> Me: #{raw}")
+
+      decode_result = try do
+        msg = KRPC_Msg.from_bin(raw)
+        {:ok, msg}
+      rescue
+        err ->
+          Logger.error(Exception.format(:error, err, __STACKTRACE__))
+          {:error, err}
+      end
+
+      case decode_result do
+        {:ok, msg} ->
+          send(self(), {:krpc, ip, port, msg})
+        {:error, err} ->
+          Logger.error("Failed to decode data: #{inspect err}. Drop this packet.")
+          File.write!("/tmp/dht_malformed.bin", raw)
+          Logger.error("Malformed packet has been writting to dht_malformed.bin")
+      end
+
+      {:noreply, state}
+    end
+
+    def handle_info({:krpc, ip, port, msg}, state) when is_map(msg) do
+      node_id = KRPC_Msg.get_sender_id(msg)
+      state2 = if node_id != nil do
+        do_add_node(node_id, ip, port, state)
+      else
+        state
+      end
+
+      state3 = do_on_krpc_msg(ip, port, msg, state2)
+      {:noreply, state3}
+    end
+
+    def handle_info({:check_node_aliveness, node_id}, state) do
+      # If the nodes's last_active time exceed threshold, delete it.
+      # Also add one candidate-node
+      bucket = DHTTable.get_corresponding_bucket(state.table, node_id)
+      case DHTBucket.get_node_by_id(bucket, node_id) do
+        nil ->
+          {:noreply, state}
+        node ->
+          if System.system_time(:second) - node.last_active > @ping_response_threshold_sec do
+            updated_bucket = DHTBucket.delete_node(bucket, node.id)
+            bucket_num = DHTTable.get_corresopnding_bucket_num(node.id)
+            t = List.replace_at(state.table.buckets, bucket_num, updated_bucket)
+            new_state = %{state | table: t}
+            {:noreply, new_state}
+          else
+            {:noreply, state}
+          end
+      end
+    end
+
+    def handle_info({:krpc_query_timeout, transaction_id}, state) do
+      case Map.pop(state.waiting_response, transaction_id) do
+        {nil, _m} ->
+          {:noreply, state}
+        {{req, req_pid}, m} ->
+          Logger.warn("krpc_query_timeout: delete #{inspect transaction_id} from waiting queue: #{inspect req}")
+          GenServer.reply(req_pid, {:error, :response_timeout})
+          new_state = %{state | waiting_response: m}
+          {:noreply, new_state}
+      end
+    end
+
+    def handle_info(msg, state) do
+      Logger.error("Unknown handle_info msg: #{inspect msg}")
+      {:noreply, state}
+    end
+
+    def do_add_node(node_id, ip, port, state) do
+      # -> state | new_state
+      Logger.debug("[do_add_node] adding node #{inspect node_id} #{inspect ip}:#{port}")
+      distance = DHTUtils.node_distance_binary(state.table.reference_node_id, node_id)
+      num = DHTTable.get_bucket_num_by_distance(distance)
+      Logger.debug("[do_add_node] dist #{inspect distance}, bucket #{num}")
+      target_bucket = DHTTable.get_bucket_by_distance(state.table, distance)
+      node = %DHTNode{id: node_id, ip: ip, port: port, last_active: System.system_time(:second)}
+
+      case DHTBucket.add_node(target_bucket, node) do
+        {:ok, updated_bucket} ->
+          updated_table = %{state.table | buckets: List.replace_at(state.table.buckets, num, updated_bucket)}
+          new_state = %{state | table: updated_table}
+          new_state
+        {:error, :bucket_full} ->
+          Logger.warn("[do_add_node] bucket full: #{inspect target_bucket}")
+          case DHTBucket.get_most_questionable_node(target_bucket) do
+            nil ->
+              # All nodes are good. Preserve long-lived nodes.
+              state
+            x ->
+              if length(target_bucket.candidates) == target_bucket.capacity do
+                state
+              else
+                bucket = DHTBucket.add_candidate(target_bucket, node)
+                updated_table = %{state.table | buckets: List.replace_at(state.table.buckets, num, bucket)}
+                this = self()
+                spawn_link(fn -> ping(this, x.id) end)
+                schedule_node_check(self(), x.id)
+                new_state = %{state | table: updated_table}
+                new_state
+              end
+          end
+      end
+    end
+
+    def send_krpc_msg!(socket, ip, port, msg) do
+      Logger.debug("[send_krpc_msg!] #{inspect msg}")
+      msg_bin = Bencoding.encode(msg)
+      Logger.debug("[udp] Me >>> #{inspect ip}:#{port}: #{inspect msg_bin}")
+      :ok = :gen_udp.send(socket, ip, port, msg_bin)
+    end
+
+    def do_on_krpc_msg(ip, port, %{"y" => "q", "q" => "ping"}=msg_ping, state) do
+      msg = KRPC_Msg.response(state.node_id, msg_ping["t"], %{})
+      send_krpc_msg!(state.socket, ip, port, msg)
+      state
+    end
+
+    def do_on_krpc_msg(ip, port, %{"y" => "q", "q" => "find_node"}=msg_find_node, state) do
+      nodes = DHTTable.get_k_nearest_nodes(state.table, msg_find_node["a"]["target"], 8)
+      node_info = Enum.map(nodes, fn x -> DHTNode.compact_info(x) end) |> Enum.join
+      resp_data = %{"nodes" => node_info}
+      msg = KRPC_Msg.response(state.node_id, msg_find_node["t"], resp_data)
+      send_krpc_msg!(state.socket, ip, port, msg)
+      state
+    end
+    def do_on_krpc_msg(ip, port, %{"y" => "q", "q" => "get_peers"}=msg_get_peers, state) do
+      info_hash = msg_get_peers["a"]["info_hash"]
+      token = TokenServer.request_token(state.token_server, ip)
+
+      resp_data = case state.peer_info[info_hash] do
+        nil ->
+          nodes = DHTTable.get_k_nearest_nodes(state.table, info_hash)
+          node_info = Enum.map(nodes, fn x -> DHTNode.compact_info(x) end) |> Enum.join
+          %{"nodes" => node_info, "token" => token}
+        values ->
+          %{"values" => values, "token" => token}
+      end
+
+      msg = KRPC_Msg.response(state.node_id, msg_get_peers["t"], resp_data)
+      send_krpc_msg!(state.socket, ip, port, msg)
+      state
+    end
+    def do_on_krpc_msg(ip, port, %{"y" => "q", "q" => "announce_peer"}=msg_announce_peer, state) do
+      token = msg_announce_peer["a"]["token"]
+      transaction_id = msg_announce_peer["t"]
+
+      if not TokenServer.is_valid_token?(state.token_server, ip, token) do
+        msg = KRPC_Msg.error(transaction_id,
+                             KRPC_msg.error_code(:protocol_error),
+                             "Invalid Token")
+        send_krpc_msg!(state.socket, ip, port, msg)
+        state
+      else
+        peer_bt_port = if Map.get(msg_announce_peer["a"], "implied_port", 0) != 0 do
+          # Use source port
+          port
+        else
+          msg_announce_peer["a"]["port"]
+        end
+        {a, b, c, d} = ip
+        info = <<a, b, c, d>> <> <<peer_bt_port::integer-size(16)>>
+        info_list = Map.get(state.peer_info, msg_announce_peer["a"]["info_hash"], [])
+        new_state = %{state | peer_info: Map.put(state.peer_info, [info|info_list])}
+        new_state
+      end
+    end
+    def do_on_krpc_msg(_ip, _port, %{"y" => "r"}=msg_response, state) do
+      # Deal with various type of responses
+      # ip, port: received this response-message from <ip>:<port>
+      transaction_id = msg_response["t"]
+      if Map.has_key?(state.waiting_response, transaction_id) do
+        {{corresponding_request, from_pid}, rest} = Map.pop(state.waiting_response, transaction_id)
+        Logger.debug("Found matching request #{inspect corresponding_request} >>> #{inspect msg_response}")
+        case corresponding_request do
+          %{"q" => "ping"} ->
+            GenServer.reply(from_pid, :ok)
+          %{"q" => "find_node"} ->
+            nodes_string = Map.get(msg_response["r"], "nodes", "")
+            nodes = DHTUtils.parse_nodes_val(nodes_string)
+            GenServer.reply(from_pid, nodes)
+          %{"q" => "get_peers"} ->
+            case msg_response do
+              %{"r"=>%{"values" => peers_val, "token" => _token}} ->
+                peers = DHTUtils.parse_peers_val(peers_val)
+                GenServer.reply(from_pid, {:peers, peers})
+
+              %{"r"=>%{"nodes" => nodes_val, "token" => _token}} ->
+                nodes = DHTUtils.parse_nodes_val(nodes_val)
+                GenServer.reply(from_pid, {:nodes, nodes})
+            end
+          %{"q" => "announce_peer"} ->
+            GenServer.reply(from_pid, :ok)
+        end
+        new_state = %{state | waiting_response: rest}
+        new_state
+      else
+        Logger.warn("(skip msg) Cannot find corresponsding query of #{inspect msg_response}.")
+        state
+      end
+    end
+    def do_on_krpc_msg(ip, port, %{"y" => "e"}=msg_error, state) do
+      [err_code, err_msg] = msg_error["a"]
+      transaction_id = msg_error["t"]
+      {{req, from_pid} , rest_waiting} = Map.delete(state.waiting_response, transaction_id)
+      new_state = %{state | waiting_response: rest_waiting}
+      Logger.error("[KRPC-error] #{inspect ip}:#{port} request: #{inspect req}. error: #{inspect msg_error}")
+      GenServer.reply(from_pid, {:error, {err_code, err_msg}})
+      new_state
+    end
+    def do_on_krpc_msg(ip, port, %{"y" => "q", "q" => unknown}=msg_unknown_query, state) do
+      transaction_id = msg_unknown_query["t"]
+      msg = KRPC_Msg.error(transaction_id,
+                           KRPC_msg.error_code(:method_unknown),
+                           "Unknown query method: #{unknown}")
+      send_krpc_msg!(state.socket, ip, port, msg)
+      state
+    end
+    def do_on_krpc_msg(ip, port, unknown_msg, state) do
+      Logger.warn("(Skip) Got unknown KRPC msg: #{inspect unknown_msg}")
+      if Map.has_key?(unknown_msg, "t") do
+        msg = KRPC_Msg.error(unknown_msg["t"],
+                            KRPC_msg.error_code(:protocol_error),
+                            "Unknown message format")
+        send_krpc_msg!(state.socket, ip, port, msg)
+      else
+        :do_nothing
+      end
+      state
+    end
+end
+
+
 IO.puts "======== Running Tests =========="
 Bencoding.test_all()
 FileServer.test_all()
