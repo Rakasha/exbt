@@ -14,54 +14,54 @@ Create a new download job by providing:
  2. An **non-exist** dir for storing job's data
 
 ```elixir
-iex> job = Job.create("/tmp/test_job", "test/centos.torrent")
+iex> myjob = Job.create("/tmp/test_job", "test/centos.torrent")
 ...
 ...
-iex> Job.start(job)
+iex> Job.start(myjob)
 ```
 
 Or from existing job dir:
 ```elixir
-iex> job = Job.load("/tmp/test_job")
+iex> myjob = Job.load("/tmp/test_job")
 ...
 ...
-iex> Job.start(job)
+iex> Job.start(myjob)
 ```
 
 ### Avaiable Commands
 
 #### Create a new job 
 ```elixir
-Job.create(<job_dir>, <torrent_path>)
+myjob = Job.create(<job_dir>, <path_of_torrent_file>)
 ```
 
 #### Load existing job
 ```elixir
-Job.load(<job_dir>)
+myjob = Job.load(<job_dir>)
 ```
 
 #### Start the job
 Start connecting to peers and start downloading
 ```elixir
-Job.start(job)
+Job.start(myjob)
 ```
 
 #### Stop the job
 Disconnect from peers. Stop all actions.
 ```elixir
-Job.stop(job)
+Job.stop(myjob)
 ```
 
 #### Pause download/uploac
 Stop download/uploading data, but keep current connections
 ```elixir
-Job.pause(job)
+Job.pause(myjob)
 ```
 
 #### Resume download/upload
 Start download/uploading data
 ```elixir
-Job.resume(job)
+Job.resume(myjob)
 ```
 
 #### Getting progress of download
@@ -71,18 +71,18 @@ iex(5)> Job.progress(job)
 ```
 OR
 ```elixir
-iex(6)> Job.finished?(job)
+iex(6)> Job.finished?(myjob)
 true
 ```
 
 #### Set the max-allowed connections
 ```elixir
-Job.set_max_connections(job, 5)
+Job.set_max_connections(myjob, 5)
 ```
 
 #### Display file info listed in the torrent metadata
 ```elixir
-iex(8)> Job.files(job)
+iex(8)> Job.files(myjob)
 [
   %{
     "length" => 578813952,
@@ -107,7 +107,7 @@ iex(8)> Job.files(job)
 
 #### Display overall status
 ```elixir
-iex(9)> Job.status(job)
+iex(9)> Job.status(myjob)
 %{
   connections: 0,
   files: [
@@ -138,7 +138,7 @@ iex(9)> Job.status(job)
 #### Get the job's dir
 
 ```elixir
-iex(10)> Job.dir(job)
+iex(10)> Job.dir(myjob)
 "/tmp/test_bt"
 ```
 
