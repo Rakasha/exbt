@@ -19,10 +19,7 @@ defmodule FileServer do
         test_piece_locations()
         info_hash = FileServer.calculate_torrent_info_hash("test/ubuntu.torrent")
         "B7B0FBAB74A85D4AC170662C645982A862826455" = Base.encode16(info_hash)
-        # Logger.debug("#{inspect URI.encode(info_hash)}")
         FileServer.calculate_torrent_info_hash("test/centos.torrent")
-#        encoded_info_hash = "%b7%b0%fb%abt%a8%5dJ%c1pf%2cdY%82%a8b%82dU"
-#        ^info_hash = URI.decode(encoded_info_hash)
     end
 
     def start(init_args) do
@@ -1057,6 +1054,7 @@ defmodule Connector do
         socket: nil, status: :new,
         raw_packet_received: nil,
         stats: %{received: 0, sent: 0},
+        support: [:extension_protocol],
         created_at: nil,
 
         # ==== file status ====
@@ -1076,7 +1074,9 @@ defmodule Connector do
         peer_id: nil, peer_ip: nil, peer_port: nil,
         peer_requested_chunks: [],
         peer_has_pieces: MapSet.new(),
-        peer_last_active_time: nil
+        peer_last_active_time: nil,
+        peer_support: [],
+        peer_extend_msg_mappings: %{},
        ]
 
     def start(init_args) do
@@ -1152,6 +1152,8 @@ defmodule Connector do
         s1 = do_handshake(state)
         Process.sleep(3000)
 
+        s2 = do_extension_handshake(s1)
+
         msg_interested = PeerWireProtocol.encode(:interested)
         send_binary_data_to_peer(msg_interested, state.socket)
 
@@ -1163,7 +1165,7 @@ defmodule Connector do
         send_binary_data_to_peer(msg_bitfield, state.socket)
 
         send(self(), :keepalive_loop)
-        new_state = %{s1 | choking_peer: false, interested_at_peer: true}
+        new_state = %{s2 | choking_peer: false, interested_at_peer: true}
         {:noreply, new_state}
     end
 
@@ -1419,10 +1421,18 @@ defmodule Connector do
 
     def do_handshake(state) do
         info_hash = GenServer.call(state.fileserver_pid, :torrent_info_hash)
-        msg = PeerWireProtocol.encode(:handshake, info_hash, state.my_p2p_id)
+        msg = PeerWireProtocol.encode(:handshake, info_hash, state.my_p2p_id, state.support)
         Logger.debug "Send handshake (HEX): #{Base.encode16(msg)}"
         :ok = send_binary_data_to_peer(msg, state.socket)
         %{state | sent_handshake: true}
+    end
+
+    def do_extension_handshake(state) do
+      msg_mappings = %{"ut_metadata" => 3}
+      info = %{"m" => msg_mappings}
+      msg = PeerWireProtocol.encode(:extended, :handshake, info)
+      :ok = send_binary_data_to_peer(msg, state.socket)
+      state
     end
 
     def is_handshake_msg?(msg) do
@@ -1471,7 +1481,7 @@ defmodule Connector do
         {:noreply, state}
     end
 
-    def on_received_peer_msg({:handshake, _reserved, info_hash, peer_id}, state) do
+    def on_received_peer_msg({:handshake, info_hash, peer_id, supported_features}, state) do
         cond do
             # Verify INFO_HASH and PEER_ID
             info_hash !== state.torrent_data.info_hash ->
@@ -1479,9 +1489,17 @@ defmodule Connector do
             # peer_id !== state.peer_id ->
             #     {:stop, "peer_id not matched: (theirs) #{inspect peer_id} vs. (mine) #{inspect state.peer_id}}", state}
             true ->
-                next_state = %{state | received_handshake: true, peer_id: peer_id}
+                next_state = %{state |
+                                received_handshake: true,
+                                peer_id: peer_id,
+                                peer_support: supported_features,
+                              }
                 {:noreply, next_state}
         end
+    end
+    def on_received_peer_msg({:extend, "handshake", info}, state) do
+      new_state = %{state | peer_extend_msg_mappings: Map.get(info, "m", %{})}
+      {:noreply, new_state}
     end
 
     def on_received_peer_msg(:choke, state) do
@@ -1636,6 +1654,16 @@ defmodule PeerWireProtocol do
         4
     end
 
+    def get_supported_features(reserved_bytes) do
+      # https://wiki.theory.org/index.php/BitTorrentSpecification#Official_Extensions_To_The_Protocol
+      feats = []
+      if DHTUtils.get_bit(reserved_bytes, 44) == 1 do
+        [:extension_protocol| feats]
+      else
+        feats
+      end
+    end
+
     def msg_type(msg) do
         cond do
             is_atom(msg) -> msg
@@ -1655,16 +1683,13 @@ defmodule PeerWireProtocol do
             :piece -> 7
             :cancel -> 8
             :port -> 9
+            :extended -> 20
             :handshake -> nil
             :keepalive -> nil
             _ -> raise("Unknown msg type #{inspect msg}")
         end
     end
 
-    def encode(:handshake, info_hash, peer_id) do
-        # handshake: <pstrlen><pstr><reserved><info_hash><peer_id>
-        <<19>> <> "BitTorrent protocol" <> <<0::size(64)>> <> info_hash <> peer_id
-    end
     def encode(:keepalive) do
         <<0::32>>
     end
@@ -1694,6 +1719,36 @@ defmodule PeerWireProtocol do
         # port: <len=0003><id=9><listen-port>
         <<3::32>> <> <<msg_id(:port), listen_port::bytes-size(2)>>
     end
+    def encode(:extended, :handshake, info) do
+      # For the extention protocol check
+      # http://www.libtorrent.org/extension_protocol.html
+      ids = Map.values(Map.get(info, "m", []))
+      if ids != Enum.uniq(ids) do
+        raise "IDs in msg_mappings cannot be duplicated: #{inspect ids}"
+      else
+        encode(:extended, :raw, 0, Bencoding.encode(info))
+      end
+    end
+    def encode(:extended, :raw, extend_msg_id, raw_data)
+    when is_binary(raw_data) and is_integer(extend_msg_id) do
+      # For the extention protocol check
+      # http://www.libtorrent.org/extension_protocol.html
+      msg_body = <<msg_id(:extended), extend_msg_id>> <> raw_data
+      <<byte_size(msg_body)::32>> <> msg_body
+    end
+    def encode(:handshake, info_hash, peer_id, supported_features) do
+      # handshake: <pstrlen><pstr><reserved><info_hash><peer_id>
+      reserved = List.foldl(supported_features, <<0::64>>,
+                            fn (feat, acc) ->
+                              case feat do
+                                :extension_protocol ->
+                                  DHTUtils.set_bit(acc, 44, 1)
+                                unknown ->
+                                  raise "Unknown feature: #{inspect unknown}"
+                              end
+                            end)
+      <<19>> <> "BitTorrent protocol" <> reserved <> info_hash <> peer_id
+    end
     def encode(:request, piece_index, begin_offset, block_length) do
         # request: <len=0013><id=6><index><begin><length>
         <<13::32, msg_id(:request), piece_index::32, begin_offset::32, block_length::32>>
@@ -1720,7 +1775,8 @@ defmodule PeerWireProtocol do
         Logger.debug "Decoding buffer #{inspect buffer}"
         result = case buffer do
             <<19>> <> "BitTorrent protocol" <> <<reserved::64, info_hash::160, peer_id::160, buffer_remain::binary>> ->
-                decoded_msg = {:handshake, <<reserved::64>>, <<info_hash::160>>, <<peer_id::160>>}
+                feats = get_supported_features(<<reserved::64>>)
+                decoded_msg = {:handshake, <<info_hash::160>>, <<peer_id::160>>, feats}
                 {:ok, decoded_msg, buffer_remain}
             <<0::32, buffer_remain::binary>> ->
                 decoded_msg = :keepalive
@@ -1756,6 +1812,9 @@ defmodule PeerWireProtocol do
                     msg_id == PeerWireProtocol.msg_id(:port) ->
                         <<listen_port::16>> = body
                         {:port, listen_port}
+                    msg_id == PeerWireProtocol.msg_id(:extended) ->
+                        <<ext_msg_id, ext_msg_body::binary>> = body
+                        {:extended, ext_msg_id, ext_msg_body}
                 end
                 {:ok, decoded_msg, buffer_remain}
             _ ->
@@ -1763,6 +1822,28 @@ defmodule PeerWireProtocol do
         end
         Logger.debug("Result of decode: #{inspect result}")
         result
+    end
+
+    def decode_extend(extend_msg, extend_msg_type) do
+      # Ignores ext_msg_id since each peer may use different msg-id mappings
+      # http://www.bittorrent.org/beps/bep_0010.html
+      # TODO: refactor
+      {:extended, :raw, ext_msg_id, ext_msg_body} = extend_msg
+      case extend_msg_type do
+        "handshake" ->
+          ^ext_msg_id = 0
+          info = Bencoding.decode(ext_msg_body)
+          {:extend, "handshake", info}
+        "ut_metadata" ->
+          case Bencoding.decode_prefix(ext_msg_body, %{}) do
+            {%{"msg_type" => 0, "piece" => index}, <<"">>} ->
+              {:extend, "ut_metadata", "request", index}
+            {%{"msg_type" => 1, "piece" => index, "total_size" => _total_size}, data} ->
+              {:extend, "ut_metadata", "data", index, data}
+            {%{"msg_type" => 2, "piece" => index}, <<"">>} ->
+              {:extend, "ut_metadata", "reject", index}
+          end
+      end
     end
 end
 
@@ -2249,24 +2330,6 @@ defmodule Listener do
 
 end
 
-
-# defmodule DHTNode do
-#     # http://www.bittorrent.org/beps/bep_0005.html
-#     # TODO: implement this
-#     use GenServer
-
-#     def start(init_args) do
-#         GenServer.start(__MODULE__, init_args)
-#     end
-
-#     def start_link(init_args) do
-#         GenServer.start(__MODULE__, init_args)
-#     end
-
-#     def init(args) do
-
-#     end
-# end
 
 defmodule TrackerClient do
     use GenServer
@@ -2837,6 +2900,21 @@ defmodule DHTBucket do
         end
       end
     end
+
+    def get_bit(bin, index) do
+      # Get the bit value at <index>. (Index starts from 0).
+      <<_left::size(index), val::1, _right::bits>> = bin
+      val
+    end
+
+    def set_bit(bin, index, value) do
+      # Set the bit value at <index>. (Index starts from 0).
+      if value not in [1, 0] do
+        raise "Invalid value: #{inspect value}"
+      end
+      <<left::size(index),     _::1, right::bits>> = bin
+      <<left::size(index), value::1, right::bits>>
+    end
   end
 
   defmodule DHTNode do
@@ -3102,10 +3180,16 @@ defmodule DHTBucket do
     end
 
     def search_peers(pid, info_hash) do
-      neighbor_nodes = GenServer.call(pid, {:stored_nearest_nodes, info_hash})
-      Logger.debug("[search_peers] picked neighbor_nodes #{inspect neighbor_nodes}")
-      acc = {neighbor_nodes, [], []}
-      search_peers(pid, info_hash, acc)
+      # -> {:ok, <list of peers>} or {:error, <reason>}
+      if bit_size(info_hash) != 160 do
+        {:error, "Invalid size of info_hash"}
+      else
+        neighbor_nodes = GenServer.call(pid, {:stored_nearest_nodes, info_hash})
+        Logger.debug("[search_peers] picked neighbor_nodes #{inspect neighbor_nodes}")
+        acc = {neighbor_nodes, [], []}
+        peers = search_peers(pid, info_hash, acc)
+        {:ok, peers}
+      end
     end
     def search_peers(pid, info_hash, acc) do
       {neighbor_nodes, searched_ids, acc_peers} = acc
