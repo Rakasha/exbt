@@ -2135,16 +2135,19 @@ defmodule JobControl do
   use GenServer
   require Logger
 
-  defstruct my_p2p_id: nil,
-            listen_port: nil,
-            checking_period: 10 * 1000,
-            fileserver_pid: nil,
-            tracker_client_pid: nil,
-            connectors: [],
-            auto_processing_timer: nil,
-            auto_connecting_timer: nil,
-            max_connections: 1,
-            max_request_chunk_length: 10240
+  defstruct [
+    my_p2p_id: nil,
+    listen_port: nil,
+    checking_period: 10 * 1000,
+    fileserver_pid: nil,
+    tracker_client_pid: nil,
+    connectors: [],
+    auto_processing_timer: nil,
+    auto_connecting_timer: nil,
+    max_connections: 1,
+    max_request_chunk_length: 10240,
+    fileserver_monitor: nil,
+  ]
 
   def start(init_args) do
     GenServer.start(__MODULE__, init_args, timeout: 60 * 1000)
@@ -2155,6 +2158,7 @@ defmodule JobControl do
   end
 
   def init(fileserver_pid) do
+
     my_p2p_id = :crypto.strong_rand_bytes(20) |> Base.encode64() |> binary_part(0, 20)
     listen_port = 8999
     {:ok, tracker_client_pid} = TrackerClient.start_link([my_p2p_id, listen_port, fileserver_pid])
@@ -2169,7 +2173,8 @@ defmodule JobControl do
       auto_processing_timer: nil,
       auto_connecting_timer: nil,
       max_connections: 1,
-      max_request_chunk_length: 10240
+      max_request_chunk_length: 10240,
+      fileserver_monitor: Process.monitor(fileserver_pid),
     }
 
     GenServer.cast(self(), :connect)
@@ -2397,7 +2402,6 @@ defmodule JobControl do
     con_list = [pid | state.connectors]
     {:noreply, %{state | connectors: con_list}}
   end
-
   def handle_info({:EXIT, pid, reason}, state) do
     cond do
       Enum.member?(state.connectors, pid) ->
@@ -2419,7 +2423,15 @@ defmodule JobControl do
         {:noreply, state}
     end
   end
-
+  def handle_info({:DOWN, ref, :process, pid, reason}, state) do
+    if ref === state.fileserver_monitor do
+      Logger.info("fileserver down. exiting...")
+      {:stop, :fileserver_down, state}
+    else
+      Logger.warn("Process DOWN: pid: #{inspect(pid)}, reason: #{inspect(reason)}")
+      {:noreply, state}
+    end
+  end
   def handle_info(:make_decision, state) do
     if state.connectors == [] do
       Logger.debug("[Controller] make_decision: No connected peer. Skip this round")
@@ -2480,7 +2492,6 @@ defmodule JobControl do
         {:noreply, %{state | auto_processing_timer: new_timer}}
     end
   end
-
   def handle_info(:auto_connect_loop, state) do
     if state.auto_connecting_timer != nil and state.max_connections > length(state.connectors) do
       n = state.max_connections - length(state.connectors)
@@ -2495,7 +2506,6 @@ defmodule JobControl do
       {:noreply, state}
     end
   end
-
   def handle_info({:have_piece, piece_index}, state) do
     # The event `:have_piece` means we have this piece on disk
     tasks =
@@ -2512,7 +2522,6 @@ defmodule JobControl do
     Enum.map(tasks, fn x -> Task.await(x, :infinity) end)
     {:noreply, state}
   end
-
   def handle_info(unknown_msg, state) do
     Logger.error("[Control] unknown msg to handle_info/2: #{inspect(unknown_msg)}")
     {:noreply, state}
