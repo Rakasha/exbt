@@ -157,6 +157,13 @@ https://www.libtorrent.org/dht_store.html
 Documents
 ========
 
+## FileServer
+
+### FileServer.Functions
+init_from_new_torrent
+init_from_torrent_info_hash
+init_from_new_metadata
+init_from_existing_job
 
 ## DHTBucket
 

@@ -2,14 +2,17 @@ defmodule FileServer do
   require Logger
   use GenServer
 
-  defstruct event_pid: nil,
-            download_dir: nil,
-            torrent_file: nil,
-            progress_file: nil,
-            trackers_file: nil,
-            decoded_torrent: nil,
-            torrent_data: nil,
-            piece_cache: nil
+  defstruct [
+    event_pid: nil,
+    download_dir: nil,
+    torrent_file: nil,
+    progress_file: nil,
+    trackers_file: nil,
+    decoded_torrent: nil,
+    torrent_data: nil,
+    piece_cache: nil,
+    metadata_piece_cache: nil,
+  ]
 
   def test_all() do
     test_find_gaps()
@@ -32,100 +35,118 @@ defmodule FileServer do
     Logger.info("init_args: #{inspect(init_args)}")
 
     case init_args do
-      {download_dir, torrent_file} ->
-        init_from_new_torrent(download_dir, torrent_file)
-
+      {download_dir, torrent_or_magnet} ->
+        if File.exists?(torrent_or_magnet) do
+          init_from_new_torrent(download_dir, torrent_or_magnet)
+        else
+          {:ok, info_hash} = DHTUtils.get_magnet_info_hash(torrent_or_magnet)
+          init_from_torrent_info_hash(download_dir, info_hash)
+        end
       download_dir ->
-        init_from_exist_job(download_dir)
+        init_from_existing_job(download_dir)
     end
   end
 
-  def init_from_exist_job(download_dir) do
+  def init_from_existing_job(download_dir) do
     # Load from half-downloaded job's dir
     File.cd!(download_dir)
     torrent_file = Path.join(get_job_status_dir(), "job.torrent")
-    progress_file = Path.join(get_job_status_dir(), "progress.txt")
-    trackers_file = Path.join(get_job_status_dir(), "trackers.txt")
 
-    decoded_torrent = parse_torrent_file(torrent_file)
-    piece_hash_list = Enum.chunk_every(:binary.bin_to_list(decoded_torrent["info"]["pieces"]), 20)
-    file_info_list = collect_file_info(decoded_torrent)
+    if not File.exists?(torrent_file) do
+      info_hash_file = Path.join(download_dir, "info_hash.bin")
+      info_hash = File.read!(info_hash_file)
+      torrent_data = %{info_hash: info_hash}
+      init_state = %FileServer{
+        download_dir: download_dir,
+        torrent_data: torrent_data,
+      }
+      Logger.info("FileServer initialized: #{inspect(init_state)}")
+      {:ok, init_state}
+    else
+      progress_file = Path.join(get_job_status_dir(), "progress.txt")
+      trackers_file = Path.join(get_job_status_dir(), "trackers.txt")
+      decoded_torrent = parse_torrent_file(torrent_file)
+      piece_hash_list = Enum.chunk_every(:binary.bin_to_list(decoded_torrent["info"]["pieces"]), 20)
+      file_info_list = collect_file_info(decoded_torrent)
 
-    file_info_list2 =
-      Enum.map(
-        file_info_list,
-        fn file_info ->
-          case target_file_progress(file_info, progress_file) do
-            {_, 0} ->
-              file_info
+      # Map files described in torrent metadata to existing filesystem
+      # Also calculate the corresponding piece-index of each file
+      file_info_list2 =
+        Enum.map(
+          file_info_list,
+          fn file_info ->
+            case target_file_progress(file_info, progress_file) do
+              {_, 0} ->
+                file_info
 
-            _else ->
-              Map.replace!(file_info, "path", file_info["path"] <> ".downloading")
+              _else ->
+                Map.replace!(file_info, "path", file_info["path"] <> ".downloading")
+            end
+          end
+        )
+
+      piece_length = decoded_torrent["info"]["piece length"]
+      total_length = List.foldl(file_info_list2, 0, fn x, total -> total + x["length"] end)
+      piece_counts = :erlang.ceil(total_length / piece_length)
+
+      last_piece_length =
+        case Integer.mod(total_length, piece_length) do
+          0 -> piece_length
+          r -> r
+        end
+
+      torrent_data = %{
+        tracker_url: decoded_torrent["announce"],
+        info_hash: calculate_torrent_info_hash(torrent_file),
+        files: file_info_list2,
+        total_length: total_length,
+        piece_length: piece_length,
+        last_piece_index: piece_counts - 1,
+        last_piece_length: last_piece_length,
+        piece_counts: piece_counts,
+        piece_hashes: Enum.map(piece_hash_list, &:binary.list_to_bin/1)
+      }
+
+      if length(torrent_data.piece_hashes) != torrent_data.piece_counts do
+        raise "Numbers not matched: amount of piece_hash(#{length(torrent_data.piece_hashes)}) vs. amount of piece(#{
+                torrent_data.piece_counts
+              })"
+      end
+
+      # Verify existence of target files
+      Enum.each(
+        torrent_data.files,
+        fn x ->
+          if not File.exists?(x["path"]) do
+            throw({:file_not_found, x["path"]})
           end
         end
       )
 
-    piece_length = decoded_torrent["info"]["piece length"]
-    total_length = List.foldl(file_info_list2, 0, fn x, total -> total + x["length"] end)
-    piece_counts = :erlang.ceil(total_length / piece_length)
+      # Verify content of target files
+      bitfield = get_bitfield(progress_file, :list)
 
-    last_piece_length =
-      case Integer.mod(total_length, piece_length) do
-        0 -> piece_length
-        r -> r
-      end
+      for {val, index} <- Enum.with_index(bitfield), val == 1 do
+        piece_data = get_piece_from_disk(torrent_data.files, index, torrent_data.piece_length)
 
-    torrent_data = %{
-      tracker_url: decoded_torrent["announce"],
-      info_hash: calculate_torrent_info_hash(torrent_file),
-      files: file_info_list2,
-      total_length: total_length,
-      piece_length: piece_length,
-      last_piece_index: piece_counts - 1,
-      last_piece_length: last_piece_length,
-      piece_counts: piece_counts,
-      piece_hashes: Enum.map(piece_hash_list, &:binary.list_to_bin/1)
-    }
-
-    if length(torrent_data.piece_hashes) != torrent_data.piece_counts do
-      raise "Numbers not matched: amount of piece_hash(#{length(torrent_data.piece_hashes)}) vs. amount of piece(#{
-              torrent_data.piece_counts
-            })"
-    end
-
-    # Verify existence of target files
-    Enum.each(
-      torrent_data.files,
-      fn x ->
-        if not File.exists?(x["path"]) do
-          throw({:file_not_found, x["path"]})
+        if :crypto.hash(:sha, piece_data) !== Enum.fetch!(torrent_data.piece_hashes, index) do
+          throw({:piece_hash_not_match, index})
         end
       end
-    )
 
-    # Verify content of target files
-    bitfield = get_bitfield(progress_file, :list)
+      init_state = %FileServer{
+        download_dir: download_dir,
+        torrent_file: torrent_file,
+        progress_file: progress_file,
+        trackers_file: trackers_file,
+        decoded_torrent: decoded_torrent,
+        torrent_data: torrent_data,
+        piece_cache: List.duplicate([], torrent_data.piece_counts)
+      }
 
-    for {val, index} <- Enum.with_index(bitfield), val == 1 do
-      piece_data = get_piece_from_disk(torrent_data.files, index, torrent_data.piece_length)
-
-      if :crypto.hash(:sha, piece_data) !== Enum.fetch!(torrent_data.piece_hashes, index) do
-        throw({:piece_hash_not_match, index})
-      end
+      Logger.info("FileServer initialized: #{inspect(init_state)}")
+      {:ok, init_state}
     end
-
-    init_state = %FileServer{
-      download_dir: download_dir,
-      torrent_file: torrent_file,
-      progress_file: progress_file,
-      trackers_file: trackers_file,
-      decoded_torrent: decoded_torrent,
-      torrent_data: torrent_data,
-      piece_cache: List.duplicate([], torrent_data.piece_counts)
-    }
-
-    Logger.info("FileServer initialized: #{inspect(init_state)}")
-    {:ok, init_state}
   end
 
   def calculate_bitfield(torrent_data) do
@@ -144,19 +165,27 @@ defmodule FileServer do
     )
   end
 
+
   def init_from_new_torrent(download_dir, original_torrent) do
-    Logger.info("[FS] init from new torrent")
-    orig_torrent_path = Path.expand(original_torrent)
+    Logger.info("[FS] init from new torrent #{inspect(original_torrent)}}")
+    metadata = File.read!(original_torrent)
+
+    # Prepare job folders
     File.mkdir!(download_dir)
     File.cd!(download_dir)
     job_status_dir = get_job_status_dir()
     File.mkdir!(job_status_dir)
+
     torrent_file = Path.join(job_status_dir, "job.torrent")
-    File.copy!(orig_torrent_path, torrent_file)
+    File.write!(torrent_file, metadata)
 
     decoded_torrent = parse_torrent_file(torrent_file)
-    file_info_list = collect_file_info(decoded_torrent)
+    prepare_files!(download_dir, decoded_torrent)
+    init_from_existing_job(download_dir)
+  end
 
+  def prepare_files!(download_dir, decoded_torrent) do
+    file_info_list = collect_file_info(decoded_torrent)
     Enum.each(
       file_info_list,
       fn x ->
@@ -166,15 +195,26 @@ defmodule FileServer do
       end
     )
 
-    progress_file = Path.join(job_status_dir, "progress.txt")
+    progress_file = Path.join(get_job_status_dir(), "progress.txt")
     total_length = List.foldl(file_info_list, 0, fn x, total -> total + x["length"] end)
     piece_counts = :erlang.ceil(total_length / decoded_torrent["info"]["piece length"])
     allocate_progress_file!(progress_file, piece_counts)
 
-    trackers_file = Path.join(job_status_dir, "trackers.txt")
+    trackers_file = Path.join(get_job_status_dir(), "trackers.txt")
     allocate_trackers_file!(trackers_file)
+  end
 
-    init_from_exist_job(download_dir)
+  def init_from_torrent_info_hash(download_dir, info_hash) do
+    Logger.info("[FS] init from info_hash")
+
+    # Prepare job folders
+    File.mkdir!(download_dir)
+    File.cd!(download_dir)
+    job_status_dir = get_job_status_dir()
+    File.mkdir!(job_status_dir)
+    info_hash_file = Path.join(download_dir, "info_hash.bin")
+    File.write!(info_hash_file, info_hash)
+    init_from_existing_job(download_dir)
   end
 
   # =============== GenServer callbacks ===============
@@ -194,6 +234,13 @@ defmodule FileServer do
 
   def handle_call(:piece_cache, _from, state) do
     {:reply, state.piece_cache, state}
+  end
+
+  def handle_call(:missing_metadata_pieces, _from, state) do
+    index_list = for {e, idx} <- Enum.with_index(state.metadata_piece_cache), is_nil(e) do
+      idx
+    end
+    {:reply, index_list, state}
   end
 
   def handle_call(:size_left, _from, state) do
@@ -264,6 +311,23 @@ defmodule FileServer do
     else
       {:reply, nil, state}
     end
+  end
+
+  def handle_call({:metadata_size, num_bytes}, _from, state) do
+    # Init the empty-cache if it's not initialized
+    case state.metadata_piece_cache do
+      nil ->
+        num_piece = (num_bytes / PeerWireProtocol.metadata_piece_length()) |> :erlang.ceil
+        new_cache = List.duplicate(nil, num_piece)
+        new_state = %{state | metadata_piece_cache: new_cache}
+        {:reply, :ok, new_state}
+      _ ->
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call(:decoded_torrent, _from, state) do
+    {:reply, state.decoded_torrent, state}
   end
 
   def handle_call({:get_piece_chunk, piece_index, begin_offset, chunk_length}, _from, state) do
@@ -392,6 +456,32 @@ defmodule FileServer do
     end
   end
 
+  def handle_call({:add_metadata_piece, index, data}, _from, state) do
+    if state.decoded_torrent != nil do
+      # Already have torrent data. Do-nothing.
+      {:reply, :ok, state}
+    else
+      meta_cache = List.replace_at(state.metadata_piece_cache, index, data)
+      if Enum.all?(meta_cache) do
+        metadata = IO.iodata_to_binary(meta_cache)
+        {:ok, _info_dict, info_dict_str} = Bencoding.decode_info_dict(metadata)
+        if state.torrent_data.info_hash != :crypto.hash(:sha, info_dict_str) do
+          throw("invalid info_hash of torrent metadata")
+        else
+          torrent_file = Path.join(get_job_status_dir(), "job.torrent")
+          File.write!(torrent_file, metadata)
+          decoded_torrent = parse_torrent_file(torrent_file)
+          prepare_files!(state.download_dir, decoded_torrent)
+          {:ok, new_state} = init_from_existing_job(state.download_dir)
+          {:reply, :ok, new_state}
+        end
+      else
+        new_state = %{state | metadata_piece_cache: meta_cache}
+        {:reply, :ok, new_state}
+      end
+    end
+  end
+
   def handle_call(:get_bitfield, _from, state) do
     response = get_bitfield(state.progress_file)
     {:reply, response, state}
@@ -445,8 +535,13 @@ defmodule FileServer do
   end
 
   def handle_call(unknown_msg, from, state) do
-    Logger.error("Unknown handle_call message from #{inspect(from)}: #{inspect(unknown_msg)}")
+    Logger.error("[FS] Unknown handle_call message from #{inspect(from)}: #{inspect(unknown_msg)}")
     {:reply, {:error, :unknown_msg}, state}
+  end
+
+  def handle_info(unknown_msg, state) do
+    Logger.error("[FS] Unknown handle_info message: #{inspect(unknown_msg)}")
+    {:noreply, state}
   end
 
   # =============== Util-functions ===============
@@ -748,6 +843,7 @@ defmodule FileServer do
   end
 
   def allocate_progress_file!(filepath, num_of_pieces) do
+    Logger.info("[FS] allocate progress file #{filepath}")
     File.touch!(filepath)
     bitfield = List.duplicate(0, num_of_pieces)
     set_bitfield!(filepath, bitfield)
@@ -758,6 +854,7 @@ defmodule FileServer do
   end
 
   def allocate_target_file!(swap_file, file_size) do
+    Logger.info("[FS] allocate target file #{swap_file}. size #{file_size}}")
     case :os.type() do
       {:unix, :linux} ->
         {_, 0} = System.cmd("fallocate", ["--length", Integer.to_string(file_size), swap_file])
@@ -1447,6 +1544,11 @@ defmodule Connector do
     {:reply, :ok, new_state}
   end
 
+  def handle_call(:send_extension_handshake, _from, state) do
+    new_state = do_extension_handshake(state)
+    {:reply, :ok, new_state}
+  end
+
   def handle_call({:request_piece, piece_index, begin_offset, chunk_length}, _from, state) do
     if state.am_choked === true do
       Logger.debug("[CN] Skip request: I am choked !!")
@@ -1467,6 +1569,21 @@ defmodule Connector do
         {:reply, :ok, state}
       end
     end
+  end
+
+  def handle_call({:request_metadata_piece, piece_index}, _from, state) do
+    case state.peer_extend_msg_mappings["ut_metadata"] do
+      nil ->
+        # Peer not supporting ut_metadata. Do-nothing.
+        :noop
+      extend_msg_id ->
+        # TODO: refactor
+        data = %{"msg_type" => 0, "piece" => piece_index}
+        raw_data = Bencoding.encode(data)
+        bin_msg = PeerWireProtocol.encode(:extended, :raw, extend_msg_id, raw_data)
+        :ok = send_binary_data_to_peer(bin_msg, state.socket)
+    end
+    {:reply, :ok, state}
   end
 
   def handle_call({:send_msg, :keepalive}, _from, state) do
@@ -1707,8 +1824,10 @@ defmodule Connector do
     # state.peer_last_active_time already updated in handle_cast/2
     {:noreply, state}
   end
-
   def on_received_peer_msg({:handshake, info_hash, peer_id, supported_features}, state) do
+    # When receving handshake message:
+    # 1. Verify torrent info_hash
+    # 2. If peer supports BEP10, send then extension-handshake message
     cond do
       # Verify INFO_HASH and PEER_ID
       info_hash !== state.torrent_data.info_hash ->
@@ -1720,49 +1839,81 @@ defmodule Connector do
       # peer_id !== state.peer_id ->
       #     {:stop, "peer_id not matched: (theirs) #{inspect peer_id} vs. (mine) #{inspect state.peer_id}}", state}
       true ->
-        next_state = %{
-          state
-          | received_handshake: true,
-            peer_id: peer_id,
-            peer_support: supported_features
-        }
-
-        {:noreply, next_state}
+        if :extension_protocol in supported_features do
+          this = self()
+          Task.start_link(fn -> GenServer.call(this, :send_extension_handshake) end)
+        else
+          :noop
+        end
+        new_state = %{state |
+                        received_handshake: true,
+                        peer_id: peer_id,
+                        peer_support: supported_features,
+                      }
+        {:noreply, new_state}
     end
   end
-
-  def on_received_peer_msg({:extend, "handshake", info}, state) do
-    new_state = %{state | peer_extend_msg_mappings: Map.get(info, "m", %{})}
+  def on_received_peer_msg({:extended, :raw, ext_msg_id, _ext_msg_body}=raw_msg, state) do
+    ext_msg = if ext_msg_id == 0 do
+      PeerWireProtocol.decode_extend(raw_msg, "handshake")
+    else
+      {ext_msg_type, ^ext_msg_id} =
+        Enum.find(state.peer_extend_msg_mappings, fn {_k, v} -> v == ext_msg_id end)
+      PeerWireProtocol.decode_extend(raw_msg, ext_msg_type)
+    end
+    Logger.debug("Got ext msg #{inspect(ext_msg)}")
+    on_received_peer_msg(ext_msg, state)
+  end
+  def on_received_peer_msg({:extended, "handshake", info}, state) do
+    if Map.has_key?(info, "metadata_size") do
+      :ok = GenServer.call(state.fileserver_pid, {:metadata_size, info["metadata_size"]})
+    else
+      :noop
+    end
+    # TODO: deal with the extension-disabling case
+    msg_mappings = Map.get(info, "m", %{})
+    new_state = %{state | peer_extend_msg_mappings: msg_mappings}
     {:noreply, new_state}
   end
-
+  def on_received_peer_msg({:extended, "ut_metadata", info}, state) do
+    # http://bittorrent.org/beps/bep_0009.html
+    Logger.debug("Got ext msg: ut_metadata, info: #{inspect(info)}")
+    case info do
+      # request-msg
+      %{"msg_type" => 0, "piece" => _index} ->
+        # TODO: send metadata-piece
+        :noop
+      # data-msg
+      %{"msg_type" => 1, "piece" => index, "total_size" => _total_size, "data" => data} ->
+        :ok = GenServer.call(state.fileserver_pid, {:add_metadata_piece, index, data})
+      # reject-msg
+      %{"msg_type" => 2, "piece" => index} ->
+        Logger.warn("Peer does not have metadata piece #{index}")
+    end
+    {:noreply, state}
+  end
   def on_received_peer_msg(:choke, state) do
     new_state = %{state | am_choked: true}
     {:noreply, new_state}
   end
-
   def on_received_peer_msg(:unchoke, state) do
     new_state = %{state | am_choked: false}
     {:noreply, new_state}
   end
-
   def on_received_peer_msg(:interested, state) do
     new_state = %{state | am_interested: true}
     {:noreply, new_state}
   end
-
   def on_received_peer_msg(:not_interested, state) do
     new_state = %{state | am_interested: false}
     {:noreply, new_state}
   end
-
   def on_received_peer_msg({:have, piece_index}, state) do
     # piece_indicators[i] === 1 means peer have data of piece-index i
     # piece_indicators: [0,1,0,1,0,0,...]   1 means 'have piece'
     new_state = %{state | peer_has_pieces: MapSet.put(state.peer_has_pieces, piece_index)}
     {:noreply, new_state}
   end
-
   def on_received_peer_msg({:bitfield, bitfield}, state) when is_bitstring(bitfield) do
     vals = bitfield_to_list(bitfield, state.torrent_data.piece_counts)
 
@@ -1774,7 +1925,6 @@ defmodule Connector do
     new_state = %{state | peer_has_pieces: MapSet.new(have_index_list)}
     {:noreply, new_state}
   end
-
   def on_received_peer_msg({:request, piece_index, offset_begin, chunk_length}, state) do
     # Peer requested for a segment of piece data (a.ka. chunk)
 
@@ -1788,7 +1938,6 @@ defmodule Connector do
       {:noreply, new_state}
     end
   end
-
   def on_received_peer_msg({:piece, piece_index, offset_begin, chunk_data}, state) do
     # Peer sends us a chunk of piece data.
     # 1. Forward the piece data to FileServer.
@@ -1805,21 +1954,18 @@ defmodule Connector do
         {:noreply, state2}
     end
   end
-
   def on_received_peer_msg({:cancel, piece_index, offset_begin, chunk_length}, state) do
     req = {piece_index, offset_begin, chunk_length}
     new_state = %{state | peer_requested_chunks: List.delete(state.peer_requested_chunks, req)}
     {:noreply, new_state}
   end
-
   def on_received_peer_msg({:port, _listen_port}, state) do
     # This is optional (for DHT)
     {:noreply, state}
   end
-
   def on_received_peer_msg(unknown_msg, state) do
-    Logger.error("Unknown peer message #{inspect(unknown_msg)}")
-    {:stop, {"Unknown peer message", unknown_msg}, state}
+    Logger.warn("Ignored unknown peer message #{inspect(unknown_msg)}")
+    {:noreply, state}
   end
 
   def send_binary_data_to_peer(data, socket) when is_binary(data) do
@@ -1896,11 +2042,18 @@ defmodule PeerWireProtocol do
     4
   end
 
-  def get_supported_features(reserved_bytes) do
-    # https://wiki.theory.org/index.php/BitTorrentSpecification#Official_Extensions_To_The_Protocol
-    feats = []
+  def metadata_piece_length do
+    # 16 KiB
+    16 * 1024
+  end
 
-    if DHTUtils.get_bit(reserved_bytes, 44) == 1 do
+  def get_supported_features(reserved_bytes) do
+    # Parse the reserved bytes of handshake message
+    # Returns list of supported feature names
+    # https://wiki.theory.org/index.php/BitTorrentSpecification#Official_Extensions_To_The_Protocol
+    Logger.debug("Reserved Bytes of handshake: #{inspect(reserved_bytes)}")
+    feats = []
+    if DHTUtils.get_bit(reserved_bytes, 43) == 1 do
       [:extension_protocol | feats]
     else
       feats
@@ -1996,8 +2149,7 @@ defmodule PeerWireProtocol do
       List.foldl(supported_features, <<0::64>>, fn feat, acc ->
         case feat do
           :extension_protocol ->
-            DHTUtils.set_bit(acc, 44, 1)
-
+            DHTUtils.set_bit(acc, 43, 1)
           unknown ->
             raise "Unknown feature: #{inspect(unknown)}"
         end
@@ -2091,7 +2243,7 @@ defmodule PeerWireProtocol do
 
               msg_id == PeerWireProtocol.msg_id(:extended) ->
                 <<ext_msg_id, ext_msg_body::binary>> = body
-                {:extended, ext_msg_id, ext_msg_body}
+                {:extended, :raw, ext_msg_id, ext_msg_body}
             end
 
           {:ok, decoded_msg, buffer_remain}
@@ -2114,19 +2266,18 @@ defmodule PeerWireProtocol do
       "handshake" ->
         ^ext_msg_id = 0
         info = Bencoding.decode(ext_msg_body)
-        {:extend, "handshake", info}
+        {:extended, "handshake", info}
 
       "ut_metadata" ->
-        case Bencoding.decode_prefix(ext_msg_body, %{}) do
-          {%{"msg_type" => 0, "piece" => index}, <<"">>} ->
-            {:extend, "ut_metadata", "request", index}
-
-          {%{"msg_type" => 1, "piece" => index, "total_size" => _total_size}, data} ->
-            {:extend, "ut_metadata", "data", index, data}
-
-          {%{"msg_type" => 2, "piece" => index}, <<"">>} ->
-            {:extend, "ut_metadata", "reject", index}
+        info = case Bencoding.decode_prefix(ext_msg_body, %{}) do
+          {%{"msg_type" => 0, "piece" => _index}=info, <<"">>} ->
+            info
+          {%{"msg_type" => 1, "piece" => _index, "total_size" => _total_size}=info, data} ->
+            %{info | "data" => data}
+          {%{"msg_type" => 2, "piece" => _index}=info, <<"">>} ->
+            info
         end
+        {:extended, "ut_metadata", info}
     end
   end
 end
@@ -2140,7 +2291,7 @@ defmodule JobControl do
     listen_port: nil,
     checking_period: 10 * 1000,
     fileserver_pid: nil,
-    tracker_client_pid: nil,
+    peer_discovery_pid: nil,
     connectors: [],
     auto_processing_timer: nil,
     auto_connecting_timer: nil,
@@ -2160,15 +2311,18 @@ defmodule JobControl do
   def init(fileserver_pid) do
 
     my_p2p_id = :crypto.strong_rand_bytes(20) |> Base.encode64() |> binary_part(0, 20)
+    # TODO: make it configureable
     listen_port = 8999
-    {:ok, tracker_client_pid} = TrackerClient.start_link([my_p2p_id, listen_port, fileserver_pid])
-
-    state = %JobControl{
+    dht_port = 6881
+    torrent_info_hash = GenServer.call(fileserver_pid, :torrent_info_hash)
+    # {:ok, tracker_client_pid} = TrackerClient.start_link([my_p2p_id, listen_port, fileserver_pid])
+    {:ok, peer_discovery_pid} = PeerDiscovery.start_link([my_p2p_id, torrent_info_hash, dht_port])
+      state = %JobControl{
       my_p2p_id: my_p2p_id,
       listen_port: listen_port,
       checking_period: 10 * 1000,
       fileserver_pid: fileserver_pid,
-      tracker_client_pid: tracker_client_pid,
+      peer_discovery_pid: peer_discovery_pid,
       connectors: [],
       auto_processing_timer: nil,
       auto_connecting_timer: nil,
@@ -2318,8 +2472,8 @@ defmodule JobControl do
     if quota <= 0 do
       {:noreply, state}
     else
-      peer_network_status = GenServer.call(state.tracker_client_pid, :peer_network_status)
-
+      found_peers = GenServer.call(state.peer_discovery_pid, :found_peers)
+      Logger.debug("Found peers: #{inspect(found_peers)}")
       tasks =
         Task.async_stream(
           state.connectors,
@@ -2339,7 +2493,7 @@ defmodule JobControl do
 
       peer_candidates =
         Enum.filter(
-          peer_network_status["peers"],
+          found_peers,
           fn x ->
             cond do
               {x["ip"], x["port"]} in peer_conns -> false
@@ -2433,6 +2587,84 @@ defmodule JobControl do
     end
   end
   def handle_info(:make_decision, state) do
+    # TODO: refactor this
+    state2 = if GenServer.call(state.fileserver_pid, :torrent_data) == nil do
+      do_download_metadata(state)
+    else
+      do_download_piece(state)
+    end
+
+    # Set the timer for the next round (if enabled)
+    case state.auto_processing_timer do
+      nil ->
+        {:noreply, state2}
+      timer ->
+        Process.cancel_timer(timer)
+        new_timer = Process.send_after(self(), :make_decision, state2.checking_period)
+        {:noreply, %{state2 | auto_processing_timer: new_timer}}
+    end
+  end
+  def handle_info(:auto_connect_loop, state) do
+    if state.auto_connecting_timer != nil and state.max_connections > length(state.connectors) do
+      n = state.max_connections - length(state.connectors)
+      Enum.map(1..n, fn _x -> GenServer.cast(self(), :connect) end)
+    end
+
+    if state.auto_connecting_timer != nil do
+      Process.cancel_timer(state.auto_connecting_timer)
+      new_timer = Process.send_after(self(), :auto_connect_loop, state.checking_period)
+      {:noreply, %{state | auto_connecting_timer: new_timer}}
+    else
+      {:noreply, state}
+    end
+  end
+  def handle_info({:have_piece, piece_index}, state) do
+    # The event `:have_piece` means we have this piece on disk
+    tasks =
+      for pid <- state.connectors do
+        Task.async(fn ->
+          try do
+            GenServer.call(pid, {:send_msg, {:have, piece_index}})
+          catch
+            :exit, reason -> {:error, reason}
+          end
+        end)
+      end
+
+    Enum.map(tasks, fn x -> Task.await(x, :infinity) end)
+    {:noreply, state}
+  end
+  def handle_info(unknown_msg, state) do
+    Logger.error("[Control] unknown msg to handle_info/2: #{inspect(unknown_msg)}")
+    {:noreply, state}
+  end
+
+  # =================================================================
+  #                   Util-functions
+  # =================================================================
+  def do_download_metadata(state) do
+    # Tell the connectors to request metadata-pieces from their connected peers
+    indices = GenServer.call(state.fileserver_pid, :missing_metadata_pieces)
+    {_, tasks} = List.foldl(state.connectors, {indices, []},
+      fn (pid, {idx_list, tasks}=acc) ->
+        cond do
+          idx_list == [] ->
+            acc
+          :extension_protocol not in :sys.get_state(pid).peer_support ->
+            GenServer.stop(pid, :normal)
+            acc
+          true ->
+            [idx|rest] = idx_list
+            t = Task.async(fn -> GenServer.call(pid, {:request_metadata_piece, idx}) end)
+            {rest, [t|tasks]}
+        end
+      end)
+    Enum.each(tasks, fn t -> Task.await(t) end)
+    state
+  end
+
+  def do_download_piece(state) do
+    # Tell the connectors to request pieces from their connected peers
     if state.connectors == [] do
       Logger.debug("[Controller] make_decision: No connected peer. Skip this round")
     else
@@ -2480,56 +2712,8 @@ defmodule JobControl do
 
       Enum.map(tasks, fn x -> Task.await(x, :infinity) end)
     end
-
-    # Set the timer for the next round (if enabled)
-    case state.auto_processing_timer do
-      nil ->
-        {:noreply, state}
-
-      timer ->
-        Process.cancel_timer(timer)
-        new_timer = Process.send_after(self(), :make_decision, state.checking_period)
-        {:noreply, %{state | auto_processing_timer: new_timer}}
-    end
+    state
   end
-  def handle_info(:auto_connect_loop, state) do
-    if state.auto_connecting_timer != nil and state.max_connections > length(state.connectors) do
-      n = state.max_connections - length(state.connectors)
-      Enum.map(1..n, fn _x -> GenServer.cast(self(), :connect) end)
-    end
-
-    if state.auto_connecting_timer != nil do
-      Process.cancel_timer(state.auto_connecting_timer)
-      new_timer = Process.send_after(self(), :auto_connect_loop, state.checking_period)
-      {:noreply, %{state | auto_connecting_timer: new_timer}}
-    else
-      {:noreply, state}
-    end
-  end
-  def handle_info({:have_piece, piece_index}, state) do
-    # The event `:have_piece` means we have this piece on disk
-    tasks =
-      for pid <- state.connectors do
-        Task.async(fn ->
-          try do
-            GenServer.call(pid, {:send_msg, {:have, piece_index}})
-          catch
-            :exit, reason -> {:error, reason}
-          end
-        end)
-      end
-
-    Enum.map(tasks, fn x -> Task.await(x, :infinity) end)
-    {:noreply, state}
-  end
-  def handle_info(unknown_msg, state) do
-    Logger.error("[Control] unknown msg to handle_info/2: #{inspect(unknown_msg)}")
-    {:noreply, state}
-  end
-
-  # =================================================================
-  #                   Util-functions
-  # =================================================================
 
   def plan_download_request(i_need_pieces, they_have_pieces) do
     # i_need_pieces: list of piece_index
@@ -2838,6 +3022,7 @@ defmodule TrackerClient do
   end
 
   def parse_tracker_response_peer_string(s, parsed_peers \\ []) do
+    # -> list of %{"ip" => <ip>, "port" => <port>}
     # Used to parse the compact-form of peer-list
     # http://www.bittorrent.org/beps/bep_0023.html
     case s do
@@ -2883,6 +3068,10 @@ defmodule Job do
   def test_all() do
   end
 
+  def test() do
+
+  end
+
   def check_requirements() do
     try do
       System.cmd("curl", ["--version"])
@@ -2892,8 +3081,8 @@ defmodule Job do
     end
   end
 
-  def create(job_dir, torrent) do
-    {:ok, fs_pid} = FileServer.start_link({job_dir, torrent})
+  def create(job_dir, torrent_or_magnet) do
+    {:ok, fs_pid} = FileServer.start_link({job_dir, torrent_or_magnet})
     {:ok, control_pid} = JobControl.start_link(fs_pid)
     GenServer.call(fs_pid, {:set_event_manager, control_pid})
     control_pid
@@ -3560,7 +3749,7 @@ defmodule DHTServer do
       waiting_response: %{},
       socket: socket
     }
-
+    GenServer.cast(self(), :bootstrap)
     {:ok, state}
   end
 
@@ -3603,6 +3792,7 @@ defmodule DHTServer do
   end
 
   def search_peers(pid, info_hash, acc) do
+    Logger.debug("[DHTServer] search peers of info_hash #{inspect(info_hash)}")
     {neighbor_nodes, searched_ids, acc_peers} = acc
 
     nodes_to_search =
@@ -3798,6 +3988,7 @@ defmodule DHTServer do
   end
 
   def handle_cast(:bootstrap, state) do
+    # TODO: make it configureable
     handle_cast({:bootstrap, {67, 215, 246, 10}, 6881}, state)
   end
 
@@ -3878,7 +4069,7 @@ defmodule DHTServer do
       node ->
         if System.system_time(:second) - node.last_active > @ping_response_threshold_sec do
           updated_bucket = DHTBucket.delete_node(bucket, node.id)
-          bucket_num = DHTTable.get_corresopnding_bucket_num(node.id)
+          bucket_num = DHTTable.get_corresopnding_bucket_num(state.table, node.id)
           t = List.replace_at(state.table.buckets, bucket_num, updated_bucket)
           new_state = %{state | table: t}
           {:noreply, new_state}
@@ -4077,7 +4268,7 @@ defmodule DHTServer do
   end
 
   def do_on_krpc_msg(ip, port, %{"y" => "e"} = msg_error, state) do
-    [err_code, err_msg] = msg_error["a"]
+    [err_code, err_msg] = msg_error["e"]
     transaction_id = msg_error["t"]
     {{req, from_pid}, rest_waiting} = Map.delete(state.waiting_response, transaction_id)
     new_state = %{state | waiting_response: rest_waiting}
@@ -4122,6 +4313,123 @@ defmodule DHTServer do
 
     state
   end
+end
+
+defmodule PeerDiscovery do
+  use GenServer
+  require Logger
+
+  @peer_search_interval 30000
+
+  # GenServer state
+  defstruct [
+    sup_pid: nil,
+    found_peers: [],
+    torrent_info_hash: nil,
+  ]
+
+  def start(init_args) do
+    GenServer.start(__MODULE__, init_args)
+  end
+
+  def start_link(init_args) do
+    GenServer.start_link(__MODULE__, init_args)
+  end
+
+  def init([my_p2p_id, torrent_info_hash, dht_port]=_init_args) do
+
+    children = [
+      %{id: DHTServer, start: {DHTServer, :start_link, [[my_p2p_id, dht_port]]}},
+    ]
+    {:ok, sup_pid} = Supervisor.start_link(children, strategy: :one_for_one)
+
+    init_state = %PeerDiscovery{
+                    sup_pid: sup_pid,
+                    torrent_info_hash: torrent_info_hash,
+                  }
+    Logger.info("[PeerDiscover] initialized: #{inspect(init_state)}")
+    {:ok, init_state, {:continue, :enable_peer_search}}
+  end
+
+  def handle_continue(:enable_peer_search, state) do
+    send(self(), {:dht_search_peers, []})
+    {:noreply, state}
+  end
+
+  def handle_call(:found_peers, _from, state) do
+    {:reply, state.found_peers, state}
+  end
+
+  def handle_call({:start_tracker, my_p2p_id, fileserver_pid, tracker_port}, _from, state) do
+    if GenServer.call(fileserver_pid, :decoded_torrent) == nil do
+      {:reply, {:error, :no_metadata}, state}
+    else
+      child_spec = %{id: TrackerClient,
+                     start: {TrackerClient, :start_link, [[my_p2p_id, tracker_port, fileserver_pid]]},
+                     restart: :transient,
+                    }
+      Supervisor.start_child(state.sup_pid, child_spec)
+      {:reply, :ok, state}
+    end
+  end
+
+  def handle_info({:dht_search_peers, peers}, state) do
+    # <peers>: from DHT get_peers
+    Logger.debug("got peers from dht: #{inspect(peers)}")
+    found_peers = (peers ++ state.found_peers) |> Enum.uniq
+    new_state = %{state | found_peers: found_peers}
+
+    # Prepare the next round
+    peer_discovery_pid = self()
+    dht_pid = get_service(state.sup_pid, :dht)
+    spawn_link(fn ->
+      Process.sleep(@peer_search_interval)
+      {:ok, peers} = DHTServer.search_peers(dht_pid, state.torrent_info_hash)
+      send(peer_discovery_pid, {:dht_search_peers, peers})
+    end)
+
+    {:noreply, new_state}
+  end
+
+  def handle_info({:tracker_search_status, peers}, state) do
+    # <peers>: from Tracker Client
+    Logger.debug("got peers from tracker: #{inspect(peers)}")
+
+    found_peers = [peers | state.found_peers] |> Enum.uniq
+    new_state = %{state | found_peers: found_peers}
+
+    # Prepare the next round
+    tracker_client = get_service(state.sup_pid, :tracker)
+    peer_discovery_pid = self()
+    spawn_link(fn ->
+      Process.sleep(@peer_search_interval)
+      peers = GenServer.call(tracker_client, :peer_network_status)["peers"]
+      send(peer_discovery_pid, {:tracker_search_status, peers})
+    end)
+
+    {:noreply, new_state}
+  end
+
+  def get_service(supervisor_pid, service) do
+    # Fetch the service's pid from its supervisor
+    # service: :dht or :tracker
+    # -> <service_pid>
+
+    children = Supervisor.which_children(supervisor_pid)
+    case service do
+      :dht ->
+        case List.keyfind(children, DHTServer, 0) do
+          {DHTServer, dht_pid, _, _} -> dht_pid
+          nil -> nil
+        end
+      :tracker ->
+        case List.keyfind(children, TrackerClient, 0) do
+          {TrackerClient, tracker_client_pid, _, _} -> tracker_client_pid
+          nil -> nil
+        end
+    end
+  end
+
 end
 
 IO.puts("======== Running Tests ==========")
