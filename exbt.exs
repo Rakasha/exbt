@@ -4248,11 +4248,11 @@ defmodule DHTServer do
 
         %{"q" => "get_peers"} ->
           case msg_response do
-            %{"r" => %{"values" => peers_val, "token" => _token}} ->
+            %{"r" => %{"values" => peers_val}} ->
               peers = DHTUtils.parse_peers_val(peers_val)
               GenServer.reply(from_pid, {:peers, peers})
 
-            %{"r" => %{"nodes" => nodes_val, "token" => _token}} ->
+            %{"r" => %{"nodes" => nodes_val}} ->
               nodes = DHTUtils.parse_nodes_val(nodes_val)
               GenServer.reply(from_pid, {:nodes, nodes})
           end
