@@ -147,7 +147,7 @@ References
 
 https://www.bittorrent.org/beps/bep_0003.html
 
-http://www.bittorrent.org/beps/bep_0005.html
+[Official spec of Bittorrent DHT Protocol (Mainline DHT)](http://www.bittorrent.org/beps/bep_0005.html)
 
 http://www.bittorrent.org/beps/bep_0009.html
 
@@ -220,9 +220,10 @@ bucket3: 0100 ~ 0111
 ### DHTTable.Functions
 - new_table
 - get_node
+- get_nodes
 - reference_node_id
 - set_bucket
-- get_k_nearest_nodes(distance)
+- get_k_nearest_nodes
 - get_bucket_num_by_distance(distance)
 - get_corresponding_bucket
 - get_corresponding_bucket_num

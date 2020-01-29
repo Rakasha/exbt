@@ -3361,14 +3361,21 @@ defmodule DHTTable do
     DHTBucket.get_node_by_id(bucket, node_id)
   end
 
+  def get_nodes(table) do
+    Enum.map(table.buckets, fn b -> b.nodes end) |> List.flatten()
+  end
+
   def reference_node_id(table) do
     table.reference_node_id
   end
 
   def get_k_nearest_nodes(table, node_id, k \\ 8) do
-    distance = DHTUtils.node_distance_binary(table.reference_node_id, node_id)
-    bucket = get_bucket_by_distance(table, distance)
-    DHTBucket.get_n_nodes(bucket, k)
+    # -> [<node>, ...]  sorted by the XOR-distance to the <node_id>
+    Enum.sort_by(get_nodes(table),
+                  fn node ->
+                    DHTUtils.node_distance_binary(node.id, node_id)
+                  end)
+      |> Enum.take(k)
   end
 
   def get_bucket_by_distance(table, distance) when is_bitstring(distance) do
@@ -3837,7 +3844,7 @@ defmodule DHTServer do
             end
           end
         )
-
+      Logger.debug("new_nodes=#{inspect(new_nodes)}, new_peers=#{inspect(new_peers)}")
       neighbor_nodes2 =
         (new_nodes ++ neighbor_nodes)
         |> Enum.uniq_by(fn x -> x.id end)
@@ -3874,7 +3881,7 @@ defmodule DHTServer do
           nodes_to_search,
           fn x ->
             case find_node(pid, target_node_id, x.ip, x.port) do
-              {:error, :response_timeout} -> []
+              {:error, _reason} -> []
               nodes -> nodes
             end
           end,
@@ -3957,11 +3964,7 @@ defmodule DHTServer do
 
   def handle_call({:stored_nearest_nodes, node_id}, _from, state) do
     # returns k-nearest nodes. sorted by distance (the closest first)
-    dist = DHTUtils.node_distance_binary(state.node_id, node_id)
-    nodes = DHTTable.get_k_nearest_nodes(state.table, dist)
-
-    sorted_nodes =
-      Enum.sort_by(nodes, fn x -> DHTUtils.node_distance_binary(state.node_id, x.id) end)
+    sorted_nodes = DHTTable.get_k_nearest_nodes(state.table, node_id)
 
     {:reply, sorted_nodes, state}
   end
@@ -4269,15 +4272,19 @@ defmodule DHTServer do
   def do_on_krpc_msg(ip, port, %{"y" => "e"} = msg_error, state) do
     [err_code, err_msg] = msg_error["e"]
     transaction_id = msg_error["t"]
-    {{req, from_pid}, rest_waiting} = Map.delete(state.waiting_response, transaction_id)
-    new_state = %{state | waiting_response: rest_waiting}
 
-    Logger.error(
-      "[KRPC-error] #{inspect(ip)}:#{port} request: #{inspect(req)}. error: #{inspect(msg_error)}"
-    )
+    if Map.has_key?(state.waiting_response, transaction_id) do
+      {{req, from_pid}, rest_waiting} = Map.pop(state.waiting_response, transaction_id)
+      new_state = %{state | waiting_response: rest_waiting}
+      Logger.error(
+        "[KRPC-error] #{inspect(ip)}:#{port} request: #{inspect(req)}. error: #{inspect(msg_error)}"
+      )
+      GenServer.reply(from_pid, {:error, {err_code, err_msg}})
+      new_state
+    else
+      state
+    end
 
-    GenServer.reply(from_pid, {:error, {err_code, err_msg}})
-    new_state
   end
 
   def do_on_krpc_msg(ip, port, %{"y" => "q", "q" => unknown} = msg_unknown_query, state) do
