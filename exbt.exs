@@ -1278,7 +1278,7 @@ defmodule Bencoding do
     end
   end
 
-  def encode_str(target, encode_as \\ :utf8) when is_bitstring(target) do
+  def encode_str(target, encode_as \\ :ascii) when is_bitstring(target) do
     case encode_as do
       :utf8 -> "#{String.length(target)}:#{target}"
       :ascii -> "#{byte_size(target)}:#{target}"
