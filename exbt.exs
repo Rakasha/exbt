@@ -3993,12 +3993,11 @@ defmodule DHTServer do
   end
 
   def handle_cast({:bootstrap, ip, port}, state) do
-    # Searches for a random node_id
-    random_target = DHTUtils.gen_node_id()
+    # Bootstrap by performing a node-lookup. Searching for itself.
     this = self()
 
     Task.start_link(fn ->
-      case find_node(this, random_target, ip, port) do
+      case find_node(this, state.node_id, ip, port) do
         {:error, reason} ->
           Logger.error("[bootstrap] failed to find_node: #{inspect(reason)}")
 
@@ -4009,7 +4008,7 @@ defmodule DHTServer do
             GenServer.call(this, {:add_node, x.id, x.ip, x.port}, :infinity)
           end)
 
-          res = search_nodes(this, random_target)
+          res = search_nodes(this, state.node_id)
           Logger.info("[bootstrap] result: #{inspect(res)}")
       end
     end)
