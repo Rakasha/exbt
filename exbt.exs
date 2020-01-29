@@ -3447,15 +3447,12 @@ defmodule DHTUtils do
   end
 
   def parse_peers_val(vals) when is_list(vals) do
-    # Just make sure its parsable
-    Enum.each(vals, fn x ->
-      <<a, b, c, d, port::16>> = x
-      ip = {a, b, c, d}
-      {ip, port}
-    end)
-
-    # Returns the origianl values (list of string)
-    vals
+    # -> [peer1, peer2, ...] where <peer> = %{"ip" => ip_tuple, "port" => port_num}
+    Enum.map(vals,
+              fn x ->
+                <<a, b, c, d, port::16>> = x
+                %{"ip" => {a, b, c, d}, "port" => port}
+              end)
   end
 
   def parse_nodes_val(bin) when is_binary(bin) do
