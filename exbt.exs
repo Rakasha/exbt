@@ -49,6 +49,7 @@ defmodule FileServer do
 
   def init_from_existing_job(download_dir) do
     # Load from half-downloaded job's dir
+    Logger.debug("[FS] Initializing from existing job dir #{download_dir}")
     File.cd!(download_dir)
     torrent_file = Path.join(get_job_status_dir(), "job.torrent")
 
@@ -447,7 +448,7 @@ defmodule FileServer do
                 {:reply, {:ok, :have_piece}, new_state}
 
               {:error, reason} ->
-                Logger.debug("Invalid piece #{piece_index} data: #{inspect(reason)}")
+                Logger.error("Invalid piece #{piece_index} data: #{inspect(reason)}")
                 {:reply, {:error, reason}, state}
             end
 
@@ -475,7 +476,9 @@ defmodule FileServer do
           decoded_torrent = parse_torrent_file(torrent_file)
           prepare_files!(state.download_dir, decoded_torrent)
           {:ok, new_state} = init_from_existing_job(state.download_dir)
-          {:reply, :ok, new_state}
+          new_state2 = %{new_state | event_pid: state.event_pid}
+          notify(new_state2.event_pid, :metadata_downloaded)
+          {:reply, :ok, new_state2}
         end
       else
         new_state = %{state | metadata_piece_cache: meta_cache}
@@ -710,7 +713,7 @@ defmodule FileServer do
   def piece_locations(piece_index, piece_length, file_info_list) do
     # Given a piece, find its corresponding file-offsets
     # -> [{filepath, offset_interval}, ...]
-
+    Logger.debug("[FS] get piece_locations of piece ##{piece_index}, length #{piece_length}, from file_info_list: #{inspect(file_info_list)}")
     total_offset_start = piece_index * piece_length
 
     total_offset_end = total_offset_start + piece_length - 1
@@ -1180,13 +1183,15 @@ defmodule Bencoding do
   end
 
   def decode_prefix_str(s, option) do
+
     log(s, label: "decode str")
     %{"str_len" => str_len} = Regex.named_captures(~r/\A(?<str_len>0|[1-9]+[0-9]*):/sm, s)
     string_length = String.to_integer(str_len)
     log(string_length, label: "str len")
 
+    encoding_type = Map.get(option, :decode_string_as, :ascii)
     result =
-      case option[:decode_string_as] do
+      case encoding_type do
         :utf8 ->
           {_, rest} = String.split_at(s, String.length(str_len) + 1)
 
@@ -1326,6 +1331,10 @@ defmodule Connector do
   use GenServer
   require Logger
 
+  @my_extend_msg_mappings %{
+                              "ut_metadata" => 2,
+                            }
+
   defstruct torrent_data: %{},
             # ==== torrent info (won't change) ====
 
@@ -1439,9 +1448,14 @@ defmodule Connector do
     msg_unchoke = PeerWireProtocol.encode(:unchoke)
     send_binary_data_to_peer(msg_unchoke, state.socket)
 
-    bitfield = GenServer.call(state.fileserver_pid, :get_bitfield)
-    msg_bitfield = PeerWireProtocol.encode(:bitfield, bitfield)
-    send_binary_data_to_peer(msg_bitfield, state.socket)
+    if GenServer.call(state.fileserver_pid, :decoded_torrent) == nil do
+      # Havent recevied full metadata. do-nothing.
+      :noop
+    else
+      bitfield = GenServer.call(state.fileserver_pid, :get_bitfield)
+      msg_bitfield = PeerWireProtocol.encode(:bitfield, bitfield)
+      send_binary_data_to_peer(msg_bitfield, state.socket)
+    end
 
     send(self(), :keepalive_loop)
     new_state = %{s2 | choking_peer: false, interested_at_peer: true}
@@ -1464,7 +1478,8 @@ defmodule Connector do
     peer_info = %{
       :id => state.peer_id,
       :ip => state.peer_ip,
-      :port => state.peer_port
+      :port => state.peer_port,
+      :support_features => state.peer_support,
     }
 
     {:reply, peer_info, state}
@@ -1570,12 +1585,14 @@ defmodule Connector do
     case state.peer_extend_msg_mappings["ut_metadata"] do
       nil ->
         # Peer not supporting ut_metadata. Do-nothing.
+        Logger.debug("(skip) request_metadata_piece ##{piece_index}: peer not supprt ut_metadata")
         :noop
       extend_msg_id ->
         # TODO: refactor
         data = %{"msg_type" => 0, "piece" => piece_index}
         raw_data = Bencoding.encode(data)
         bin_msg = PeerWireProtocol.encode(:extended, :raw, extend_msg_id, raw_data)
+        Logger.debug("request_metadata_piece ##{piece_index}")
         :ok = send_binary_data_to_peer(bin_msg, state.socket)
     end
     {:reply, :ok, state}
@@ -1764,8 +1781,8 @@ defmodule Connector do
   end
 
   def do_extension_handshake(state) do
-    msg_mappings = %{"ut_metadata" => 3}
-    info = %{"m" => msg_mappings}
+    info = %{"m" => @my_extend_msg_mappings}
+    Logger.debug("Sending extension handshake: #{inspect(info)}")
     msg = PeerWireProtocol.encode(:extended, :handshake, info)
     :ok = send_binary_data_to_peer(msg, state.socket)
     state
@@ -1849,15 +1866,22 @@ defmodule Connector do
     end
   end
   def on_received_peer_msg({:extended, :raw, ext_msg_id, _ext_msg_body}=raw_msg, state) do
+    Logger.debug("Processing raw extended msg ##{ext_msg_id} #{inspect(raw_msg)} with mappings=#{inspect(state.peer_extend_msg_mappings)}")
+
     ext_msg = if ext_msg_id == 0 do
       PeerWireProtocol.decode_extend(raw_msg, "handshake")
     else
       {ext_msg_type, ^ext_msg_id} =
-        Enum.find(state.peer_extend_msg_mappings, fn {_k, v} -> v == ext_msg_id end)
+        Enum.find(@my_extend_msg_mappings, fn {_k, v} -> v == ext_msg_id end)
       PeerWireProtocol.decode_extend(raw_msg, ext_msg_type)
     end
+
     Logger.debug("Got ext msg #{inspect(ext_msg)}")
-    on_received_peer_msg(ext_msg, state)
+    if ext_msg == :not_supported do
+      {:noreply, state}
+    else
+      on_received_peer_msg(ext_msg, state)
+    end
   end
   def on_received_peer_msg({:extended, "handshake", info}, state) do
     if Map.has_key?(info, "metadata_size") do
@@ -2264,15 +2288,25 @@ defmodule PeerWireProtocol do
         {:extended, "handshake", info}
 
       "ut_metadata" ->
-        info = case Bencoding.decode_prefix(ext_msg_body, %{}) do
+        decode_result = try do
+          Bencoding.decode_prefix(ext_msg_body, %{})
+        rescue
+          err ->
+            fpath = "/tmp/extend_msg.bin"
+            File.write!(fpath, ext_msg_body)
+            raise("Failed to decode extend_msg: #{inspect(err)}. Msg written to #{fpath}")
+        end
+        msg_info = case decode_result do
           {%{"msg_type" => 0, "piece" => _index}=info, <<"">>} ->
             info
-          {%{"msg_type" => 1, "piece" => _index, "total_size" => _total_size}=info, data} ->
-            %{info | "data" => data}
+          {%{"msg_type" => 1, "piece" => _index, "total_size" => _total_size}=info, bin_data} ->
+            Map.put(info, "data", bin_data)
           {%{"msg_type" => 2, "piece" => _index}=info, <<"">>} ->
             info
         end
-        {:extended, "ut_metadata", info}
+        {:extended, "ut_metadata", msg_info}
+      _ ->
+        :not_supported
     end
   end
 end
@@ -2662,20 +2696,29 @@ defmodule JobControl do
   def do_download_metadata(state) do
     # Tell the connectors to request metadata-pieces from their connected peers
     indices = GenServer.call(state.fileserver_pid, :missing_metadata_pieces)
+    Logger.debug("[Control] Still requires metadata piecese: #{inspect(indices)}")
     {_, tasks} = List.foldl(state.connectors, {indices, []},
-      fn (pid, {idx_list, tasks}=acc) ->
-        cond do
-          idx_list == [] ->
+        fn (pid, {idx_list, tasks}=acc) ->
+          if idx_list == [] do
             acc
-          :extension_protocol not in :sys.get_state(pid).peer_support ->
-            GenServer.stop(pid, :normal)
-            acc
-          true ->
-            [idx|rest] = idx_list
-            t = Task.async(fn -> GenServer.call(pid, {:request_metadata_piece, idx}) end)
-            {rest, [t|tasks]}
-        end
-      end)
+          else
+            try do
+              peer_info = GenServer.call(pid, :peer_info)
+              if :extension_protocol not in peer_info.support_features do
+                GenServer.stop(pid, :normal)
+                acc
+              else
+                [idx|rest] = idx_list
+                t = Task.async(fn -> GenServer.call(pid, {:request_metadata_piece, idx}) end)
+                {rest, [t|tasks]}
+              end
+            catch
+              :exit, reason ->
+                Logger.error("Failed to get metadata info: #{inspect(reason)}")
+                acc
+            end
+          end
+        end)
     Enum.each(tasks, fn t -> Task.await(t) end)
     state
   end
