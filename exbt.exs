@@ -464,7 +464,8 @@ defmodule FileServer do
     else
       meta_cache = List.replace_at(state.metadata_piece_cache, index, data)
       if Enum.all?(meta_cache) do
-        metadata = IO.iodata_to_binary(meta_cache)
+        info_dict = IO.iodata_to_binary(meta_cache) |> Bencoding.decode()
+        metadata = Map.put(%{}, "info", info_dict) |> Bencoding.encode()
         {:ok, _info_dict, info_dict_str} = Bencoding.decode_info_dict(metadata)
         if state.torrent_data.info_hash != :crypto.hash(:sha, info_dict_str) do
           throw("invalid info_hash of torrent metadata")
@@ -1082,11 +1083,12 @@ defmodule Bencoding do
   end
 
   def decode_info_dict(s) do
-    # Extract only the info-dict and its original Bencoded string.
+    # Extract only the info-dict and its original Bencoded string from the decoded_torrent
     # -> {:error, reason}
     # -> {:ok, decoded_info_dict, original_str_of_info_dict}
-    if not is_map(decode(s)["info"]) do
-      {:error, "Invalid torrent: cannot find torrent info-dict"}
+    r = decode(s)
+    if not is_map(r["info"]) do
+      {:error, "Invalid torrent: cannot find torrent info-dict in #{inspect(r)}"}
     else
       try do
         decode(s, %{extract_info_dict: true})
