@@ -236,6 +236,10 @@ defmodule FileServer do
     {:reply, state.piece_cache, state}
   end
 
+  def handle_call(:metadata_piece_cache, _from, state) do
+    {:reply, state.metadata_piece_cache, state}
+  end
+
   def handle_call(:missing_metadata_pieces, _from, state) do
     index_list = for {e, idx} <- Enum.with_index(state.metadata_piece_cache), is_nil(e) do
       idx
@@ -2596,10 +2600,16 @@ defmodule JobControl do
   end
   def handle_info(:make_decision, state) do
     # TODO: refactor this
-    state2 = if GenServer.call(state.fileserver_pid, :torrent_data) == nil do
-      do_download_metadata(state)
-    else
-      do_download_piece(state)
+    decoded_torrent = GenServer.call(state.fileserver_pid, :decoded_torrent)
+    metadata_piece_cache = GenServer.call(state.fileserver_pid, :metadata_piece_cache)
+    state2 = cond do
+      decoded_torrent != nil ->
+        do_download_piece(state)
+      decoded_torrent == nil and metadata_piece_cache != nil ->
+        do_download_metadata(state)
+      true ->
+        Logger.debug("[make_decision] Neither torrent nor metadata_cache has been initialized. Skip this round.")
+        state
     end
 
     # Set the timer for the next round (if enabled)
