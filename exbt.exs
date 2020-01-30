@@ -1934,15 +1934,21 @@ defmodule Connector do
     {:noreply, new_state}
   end
   def on_received_peer_msg({:bitfield, bitfield}, state) when is_bitstring(bitfield) do
-    vals = bitfield_to_list(bitfield, state.torrent_data.piece_counts)
+    if GenServer.call(state.fileserver_pid, :decoded_torrent) == nil do
+      Logger.warn("[FS] no metadata. not storing bitfield")
+      {:noreply, state}
+    else
+      vals = bitfield_to_list(bitfield, state.torrent_data.piece_counts)
 
-    have_index_list =
-      for {val, idx} <- Enum.with_index(vals), val == 1 do
-        idx
-      end
+      have_index_list =
+        for {val, idx} <- Enum.with_index(vals), val == 1 do
+          idx
+        end
 
-    new_state = %{state | peer_has_pieces: MapSet.new(have_index_list)}
-    {:noreply, new_state}
+      new_state = %{state | peer_has_pieces: MapSet.new(have_index_list)}
+      {:noreply, new_state}
+    end
+
   end
   def on_received_peer_msg({:request, piece_index, offset_begin, chunk_length}, state) do
     # Peer requested for a segment of piece data (a.ka. chunk)
@@ -2280,7 +2286,7 @@ defmodule PeerWireProtocol do
     # http://www.bittorrent.org/beps/bep_0010.html
     # TODO: refactor
     {:extended, :raw, ext_msg_id, ext_msg_body} = extend_msg
-
+    Logger.debug("[Connector] Decoding ext msg #{inspect(extend_msg)} of extend_msg_type #{extend_msg_type}")
     case extend_msg_type do
       "handshake" ->
         ^ext_msg_id = 0
@@ -2683,6 +2689,18 @@ defmodule JobControl do
       end
 
     Enum.map(tasks, fn x -> Task.await(x, :infinity) end)
+    {:noreply, state}
+  end
+  def handle_info(:metadata_downloaded, state) do
+    # Tell all connectors send out the bitfield
+
+    bitfield = GenServer.call(state.fileserver_pid, :get_bitfield)
+    bin_msg = PeerWireProtocol.encode(:bitfield, bitfield)
+    Task.async_stream(state.connectors,
+                      fn conn ->
+                        GenServer.call(conn, {:send_msg, bin_msg})
+                      end, timeout: 2000, on_timeout: :kill_task)
+      |> Enum.to_list()
     {:noreply, state}
   end
   def handle_info(unknown_msg, state) do
@@ -4333,7 +4351,7 @@ defmodule DHTServer do
     if Map.has_key?(state.waiting_response, transaction_id) do
       {{req, from_pid}, rest_waiting} = Map.pop(state.waiting_response, transaction_id)
       new_state = %{state | waiting_response: rest_waiting}
-      Logger.error(
+      Logger.warn(
         "[KRPC-error] #{inspect(ip)}:#{port} request: #{inspect(req)}. error: #{inspect(msg_error)}"
       )
       GenServer.reply(from_pid, {:error, {err_code, err_msg}})
@@ -4382,7 +4400,7 @@ defmodule PeerDiscovery do
   use GenServer
   require Logger
 
-  @peer_search_interval 30000
+  @peer_search_interval 60000
 
   # GenServer state
   defstruct [
@@ -4415,6 +4433,7 @@ defmodule PeerDiscovery do
   end
 
   def handle_continue(:enable_peer_search, state) do
+    # TODO: enable tracker search
     send(self(), {:dht_search_peers, []})
     {:noreply, state}
   end
