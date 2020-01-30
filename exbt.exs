@@ -1367,7 +1367,7 @@ defmodule Connector do
   end
 
   def do_log(level, msg, state) do
-    prefix = "[Connector #{state.peer_ip}:#{state.peer_port}]: "
+    prefix = "[Connector #{inspect(state.peer_ip)}:#{state.peer_port}]: "
     Logger.log(level, prefix <> msg)
   end
 
@@ -1405,34 +1405,26 @@ defmodule Connector do
       created_at: System.system_time(:second)
     }
 
-    Logger.debug("Connector init: #{inspect(state)}")
-    {:ok, state, {:continue, :attempt_connect}}
+    Logger.debug("[gen_tcp] Connecting to #{inspect(state.peer_ip)}:#{inspect(state.peer_port)} ...")
+
+    case :gen_tcp.connect(state.peer_ip, state.peer_port, [:binary, active: true], 10000) do
+      {:ok, socket} ->
+        Logger.info("[gen_tcp] Connected to #{inspect(state.peer_ip)}:#{state.peer_port}")
+        s2 = %{state | socket: socket, peer_last_active_time: System.system_time(:second)}
+        {:ok, s2, {:continue, :after_connect}}
+      {:error, :timeout} ->
+        {:stop, {:shutdown, {:gen_tcp_connect, :timeout}}, state}
+      {:error, reason} ->
+        {:stop, {:gen_tcp_connect, reason}, state}
+    end
   end
 
   ##########################################################################
   #                GenServer Callbacks
   ##########################################################################
 
-  def handle_continue(:attempt_connect, state) do
-    Logger.debug("[gen_tcp] Connecting to #{state.peer_ip}:#{inspect(state.peer_port)} ...")
-
-    case :gen_tcp.connect(
-           to_charlist(state.peer_ip),
-           state.peer_port,
-           [:binary, active: true],
-           10000
-         ) do
-      {:ok, socket} ->
-        Logger.info("[gen_tcp] Connected to #{state.peer_ip}:#{state.peer_port}")
-        s2 = %{state | socket: socket, peer_last_active_time: System.system_time(:second)}
-        {:noreply, s2, {:continue, :after_connect}}
-
-      {:error, reason} ->
-        {:stop, {:gen_tcp_connect, reason}, state}
-    end
-  end
-
   def handle_continue(:after_connect, state) do
+    # This is the phase of performing handshakes
     s1 = do_handshake(state)
     Process.sleep(3000)
 
@@ -2522,17 +2514,27 @@ defmodule JobControl do
 
     peer_id = nil
     torrent_data = GenServer.call(state.fileserver_pid, :torrent_data)
-    args = [peer_ip, peer_port, torrent_data, state.my_p2p_id, peer_id, state.fileserver_pid]
 
-    case Connector.start_link(args) do
-      {:ok, pid} ->
-        new_state = %{state | connectors: [pid | state.connectors]}
-        {:noreply, new_state}
-
-      {:error, reason} ->
-        Logger.warn("Failed to create connector with args #{inspect(args)}: #{inspect(reason)}")
-        {:noreply, state}
+    # Convert IP: "1.2.3.4" -> {1,2,3,4}
+    peer_ip_addr = case peer_ip do
+      x when is_tuple(x) ->
+        x
+      x when is_binary(x) ->
+        {:ok, addr} = :inet.getaddr(String.to_charlist(x) , :inet)
+        addr
     end
+
+    args = [peer_ip_addr, peer_port, torrent_data, state.my_p2p_id, peer_id, state.fileserver_pid]
+    this = self()
+    spawn_link(fn ->
+                 case Connector.start(args) do
+                    {:ok, pid} ->
+                      send(this, {:connected, pid})
+                    {:error, _reason} ->
+                      :do_nothing
+                 end
+               end)
+    {:noreply, state}
   end
 
   def handle_cast(:make_decision, state) do
@@ -2549,6 +2551,12 @@ defmodule JobControl do
     {:noreply, state}
   end
 
+  def handle_info({:connected, connector_pid}, state) do
+    Logger.debug("[Control] connected: #{inspect(connector_pid)}")
+    Process.link(connector_pid)
+    new_state = %{state | connectors: [connector_pid|state.connectors]}
+    {:noreply, new_state}
+  end
   def handle_info({:incoming_connect, socket}, state) do
     init_args = [socket, state.torrent_data, state.my_p2p_id, nil, state.fileserver_pid]
     {:ok, pid} = Connector.start_link(init_args)
