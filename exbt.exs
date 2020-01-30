@@ -419,21 +419,18 @@ defmodule FileServer do
                 mark_piece_downloaded!(state.progress_file, piece_index)
                 notify(state.event_pid, {:have_piece, piece_index})
                 # TODO: Check ONLY the corresponding file instead of checking all
+                # If the entire file has been downloaded, make sure it has the (.downloading) removed.
                 new_file_info_list =
                   Enum.map(
                     state.torrent_data.files,
                     fn file_info ->
-                      case target_file_progress(file_info, state.progress_file) do
-                        {_, 0} ->
-                          # Strips the ".downloading" ext from filename since the file is finished
-                          if Path.extname(file_info["path"]) == ".downloading" do
-                            new_path = Path.rootname(file_info["path"], ".downloading")
-                            :ok = File.rename(file_info["path"], new_path)
-                            Map.replace!(file_info, "path", new_path)
-                          end
-
-                        _else ->
-                          file_info
+                      {_, num_unfinished} = target_file_progress(file_info, state.progress_file)
+                      if num_unfinished == 0 and Path.extname(file_info["path"]) == ".downloading" do
+                        new_path = Path.rootname(file_info["path"], ".downloading")
+                        :ok = File.rename(file_info["path"], new_path)
+                        Map.replace!(file_info, "path", new_path)
+                      else
+                        file_info
                       end
                     end
                   )
