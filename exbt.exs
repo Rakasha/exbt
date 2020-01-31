@@ -2368,38 +2368,42 @@ defmodule JobControl do
     my_p2p_id = :crypto.strong_rand_bytes(20) |> Base.encode64() |> binary_part(0, 20)
     # TODO: make it configureable
     listen_port = 8999
-    dht_port = 0 # 0 means auto-assignment
-    torrent_info_hash = GenServer.call(fileserver_pid, :torrent_info_hash)
-    # {:ok, tracker_client_pid} = TrackerClient.start_link([my_p2p_id, listen_port, fileserver_pid])
-    {:ok, peer_discovery_pid} = PeerDiscovery.start_link([my_p2p_id, torrent_info_hash, dht_port])
-      state = %JobControl{
+
+    state = %JobControl{
       my_p2p_id: my_p2p_id,
       listen_port: listen_port,
       checking_period: 10 * 1000,
       fileserver_pid: fileserver_pid,
-      peer_discovery_pid: peer_discovery_pid,
       connectors: [],
       auto_processing_timer: nil,
       auto_connecting_timer: nil,
       max_connections: 1,
       max_request_chunk_length: 10240,
-      fileserver_monitor: Process.monitor(fileserver_pid),
     }
 
     GenServer.cast(self(), :connect)
     Process.flag(:trap_exit, true)
     Logger.info("JobControl Initialized: #{inspect(state)}")
-    {:ok, state}
+    {:ok, state, {:continue, :after_init}}
   end
 
-  def terminate(reason, _state) do
+  def handle_continue(:after_init, state) do
+    dht_port = 0 # 0 means auto-assignment
+    torrent_info_hash = GenServer.call(state.fileserver_pid, :torrent_info_hash)
+    {:ok, peer_discovery_pid} = PeerDiscovery.start_link([state.my_p2p_id, torrent_info_hash, dht_port])
+    new_state = %{state |
+                    peer_discovery_pid: peer_discovery_pid,
+                    fileserver_monitor: Process.monitor(state.fileserver_pid),
+                  }
+    {:noreply, new_state}
+  end
+
+  def terminate(reason, state) do
+
     Logger.info("JobControl terminated: #{inspect(reason)}")
+    GenServer.stop(state.peer_discovery_pid)
   end
 
-  def handle_call(:state, _from, state) do
-    # For debugging
-    {:reply, state, state}
-  end
 
   def handle_call(:get_fileserver, _from, state) do
     {:reply, state.fileserver_pid, state}
@@ -3172,7 +3176,9 @@ defmodule Job do
 
   def close(job_control) do
     stop(job_control)
+    fs_pid = GenServer.call(job_control, :get_fileserver)
     GenServer.stop(job_control)
+    GenServer.stop(fs_pid)
   end
 
   def start(job_control) do
@@ -4377,7 +4383,7 @@ defmodule PeerDiscovery do
   # GenServer state
   defstruct [
     sup_pid: nil,
-    found_peers: [],
+    found_peers: nil,
     torrent_info_hash: nil,
   ]
 
@@ -4389,25 +4395,27 @@ defmodule PeerDiscovery do
     GenServer.start_link(__MODULE__, init_args)
   end
 
-  def init([my_p2p_id, torrent_info_hash, dht_port]=_init_args) do
+  def init([my_p2p_id, torrent_info_hash, dht_port]) do
 
+    init_state = %PeerDiscovery{
+                    torrent_info_hash: torrent_info_hash,
+                    found_peers: [],
+                  }
+    Logger.info("[PeerDiscover] initialized: #{inspect(init_state)}")
+    {:ok, init_state, {:continue, {:enable_peer_search, my_p2p_id, dht_port}}}
+  end
+
+  def handle_continue({:enable_peer_search, my_p2p_id, dht_port}, state) do
+    # TODO: enable tracker search
     children = [
       %{id: DHTServer, start: {DHTServer, :start_link, [[my_p2p_id, dht_port]]}},
     ]
     {:ok, sup_pid} = Supervisor.start_link(children, strategy: :one_for_one)
 
-    init_state = %PeerDiscovery{
-                    sup_pid: sup_pid,
-                    torrent_info_hash: torrent_info_hash,
-                  }
-    Logger.info("[PeerDiscover] initialized: #{inspect(init_state)}")
-    {:ok, init_state, {:continue, :enable_peer_search}}
-  end
+    new_state = %{state | sup_pid: sup_pid}
 
-  def handle_continue(:enable_peer_search, state) do
-    # TODO: enable tracker search
     send(self(), {:dht_search_peers, []})
-    {:noreply, state}
+    {:noreply, new_state}
   end
 
   def handle_call(:found_peers, _from, state) do
