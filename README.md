@@ -40,6 +40,13 @@ myjob = Job.create(<job_dir>, <path_of_torrent_file>)
 myjob = Job.load(<job_dir>)
 ```
 
+#### Closing an existing job
+This will stop all process that relates to this job
+
+```elixir
+Job.close(myjob)
+```
+
 #### Start the job
 Start connecting to peers and start downloading
 ```elixir
