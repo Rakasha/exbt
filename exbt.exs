@@ -142,11 +142,32 @@ defmodule FileServer do
         trackers_file: trackers_file,
         decoded_torrent: decoded_torrent,
         torrent_data: torrent_data,
-        piece_cache: List.duplicate([], torrent_data.piece_counts)
+        piece_cache: List.duplicate([], torrent_data.piece_counts),
+        metadata_piece_cache: load_metadata_cache(decoded_torrent),
       }
 
       Logger.info("FileServer initialized: #{inspect(init_state)}")
       {:ok, init_state}
+    end
+  end
+
+  def load_metadata_cache(decoded_torrent) do
+    # -> [<metadata_piece_1>, <metadata_piece_2>...]
+    info_dict = decoded_torrent["info"]
+    data = Bencoding.encode(info_dict)
+    chunk_binary(data, PeerWireProtocol.metadata_piece_length())
+  end
+
+  def chunk_binary(data, num_bytes) when is_binary(data) do
+    # Split the binary data into chunks. The last chunk may have size smaller then <num_bytes>
+    # -> [<bin_data>, ...]
+    case data do
+      <<>> ->
+        []
+      <<x::size(num_bytes), rest::binary>> ->
+        [<<x::size(num_bytes)>> | chunk_binary(rest, num_bytes)]
+      _ ->
+        [data]
     end
   end
 
@@ -458,6 +479,22 @@ defmodule FileServer do
     end
   end
 
+  def handle_call(:metadata_size, _from, state) do
+    resp =
+      case state.decoded_torrent["info"] do
+        nil ->
+          :no_metadata
+        x ->
+          byte_size(Bencoding.encode(x))
+      end
+    {:reply, resp, state}
+  end
+
+  def handle_call({:get_metadata_piece, index}, _from, state) do
+    data = Enum.at(state.metadata_piece_cache, index)
+    {:reply, data, state}
+  end
+
   def handle_call({:add_metadata_piece, index, data}, _from, state) do
     if state.decoded_torrent != nil do
       # Already have torrent data. Do-nothing.
@@ -522,10 +559,9 @@ defmodule FileServer do
           # find out the "gaps" between each sorted chunks
           cached_chunks = Enum.fetch!(state.piece_cache, piece_index)
 
-          intervals =
-            for {start_pos, end_pos, _data} <- cached_chunks do
-              {start_pos, end_pos}
-            end
+          intervals = for {start_pos, end_pos, _data} <- cached_chunks do
+                        {start_pos, end_pos}
+                      end
 
           find_gaps(intervals, piece_length)
       end
@@ -553,16 +589,12 @@ defmodule FileServer do
   def target_file_progress(file_info, progress_file) do
     # -> {num_finished_pieces, num_unfinished_pieces}
     num_finished_pieces =
-      Enum.count(
-        file_info["piece_index_range"],
-        fn idx -> have_piece?(idx, progress_file) end
-      )
+      Enum.count(file_info["piece_index_range"],
+                 fn idx -> have_piece?(idx, progress_file) end)
 
     num_unfinished_pieces =
-      Enum.count(
-        file_info["piece_index_range"],
-        fn idx -> not have_piece?(idx, progress_file) end
-      )
+      Enum.count(file_info["piece_index_range"],
+                 fn idx -> not have_piece?(idx, progress_file) end)
 
     {num_finished_pieces, num_unfinished_pieces}
   end
@@ -606,11 +638,7 @@ defmodule FileServer do
     # chunk = {start, end, data}
 
     # sort by start_offset
-    sorted_chunk_list =
-      Enum.sort_by(
-        chunk_list,
-        fn {start, _, _} -> start end
-      )
+    sorted_chunk_list = Enum.sort_by(chunk_list, fn {start, _, _} -> start end)
 
     Enum.reduce_while(sorted_chunk_list, [], fn incoming_chunk, processed_chunks ->
       acc =
@@ -734,6 +762,18 @@ defmodule FileServer do
       end)
 
     Enum.reverse(reversed_loc)
+  end
+
+  def piece_size(piece_index, piece_counts, total_length, std_piece_length) do
+    if piece_index == piece_counts - 1 do
+      # The last piece may have a different piece_length
+      case Integer.mod(total_length, std_piece_length) do
+        0 -> std_piece_length
+        r -> r
+      end
+    else
+      std_piece_length
+    end
   end
 
   def test_piece_locations() do
@@ -1896,18 +1936,29 @@ defmodule Connector do
   end
   def on_received_peer_msg({:extended, "ut_metadata", info}, state) do
     # http://bittorrent.org/beps/bep_0009.html
-    Logger.debug("Got ext msg: ut_metadata, info: #{inspect(info)}")
+    do_log(:debug, "Got ext msg: ut_metadata, info: #{inspect(info)}", state)
     case info do
       # request-msg
-      %{"msg_type" => 0, "piece" => _index} ->
-        # TODO: send metadata-piece
-        :noop
+      %{"msg_type" => 0, "piece" => index} ->
+        resp_payload =
+          case GenServer.call(state.fileserver_pid, {:get_metadata_piece, index}) do
+            nil ->
+              d = %{"msg_type" => 2, "piece" => index}
+              Bencoding.encode(d)
+            piece_data ->
+              metadata_size = GenServer.call(state.fileserver_pid, :metadata_size)
+              d = %{"msg_type" => 1, "piece" => index, "total_size" => metadata_size}
+              Bencoding.encode(d) <> piece_data
+          end
+        ext_msg_id = state.peer_extend_msg_mappings["ut_metadata"]
+        bin_msg = PeerWireProtocol.encode({:extended, :raw, ext_msg_id, resp_payload})
+        send_binary_data_to_peer(bin_msg, state.socket)
       # data-msg
       %{"msg_type" => 1, "piece" => index, "total_size" => _total_size, "data" => data} ->
         :ok = GenServer.call(state.fileserver_pid, {:add_metadata_piece, index, data})
       # reject-msg
       %{"msg_type" => 2, "piece" => index} ->
-        Logger.warn("Peer does not have metadata piece #{index}")
+        do_log(:warn, "Peer does not have metadata piece #{index}", state)
     end
     {:noreply, state}
   end
