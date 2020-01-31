@@ -32,7 +32,7 @@ defmodule FileServer do
   end
 
   def init(init_args) do
-    Logger.info("init_args: #{inspect(init_args)}")
+    Logger.info("[FileServer] init_args: #{inspect(init_args)}")
 
     case init_args do
       {download_dir, torrent_or_magnet} ->
@@ -384,11 +384,7 @@ defmodule FileServer do
     # 1. Verify integrity (offset, size, index, hash)
     # 2. Save a portion of a piece into cache.
     # 3. If it forms a complete piece of data, save the entire piece into disk and remove the corresponding cache
-    Logger.debug(
-      "[FS] Received piece_chunk #{inspect({piece_index, begin_offset, chunk_data})} size=#{
-        byte_size(chunk_data)
-      }"
-    )
+    Logger.debug("[FS] Received piece_chunk #{inspect({piece_index, begin_offset, chunk_data})} size=#{byte_size(chunk_data)}")
 
     cond do
       have_piece?(piece_index, state.progress_file) ->
@@ -1092,19 +1088,6 @@ end
 
 defmodule Bencoding do
   require Logger
-  # @type B_any() ::
-  #                 | B_str
-  #                 | B_int
-  #                 | B_list
-  #                 | B_dict
-
-  # @type B_dict() :: d(<B_str><B_any>)*e
-
-  # @type B_str() :: <int>:<char length:int>
-
-  # @type B_int() :: i<int>e
-
-  # @type B_list() :: l<B_any>*e
 
   def log(_data, _args \\ [label: ""]) do
     # IO.inspect data, label: args[:label]
@@ -1114,8 +1097,6 @@ defmodule Bencoding do
   def test_all() do
     test_decode()
     test_encode()
-
-    decode(File.read!("test/curl_output.bin"))
   end
 
   def decode(s, option \\ %{}) do
@@ -1348,7 +1329,6 @@ defmodule Bencoding do
         end
       )
 
-    #        log sorted_kwlist, label: "sorted kwlist"
     encoded_list =
       Enum.reduce(
         sorted_kwlist,
@@ -1419,7 +1399,7 @@ defmodule Connector do
   end
 
   def do_log(level, msg, state) do
-    prefix = "[Connector #{inspect(state.peer_ip)}:#{state.peer_port}]: "
+    prefix = "[Connector #{inspect(state.peer_ip)}:#{state.peer_port}] "
     Logger.log(level, prefix <> msg)
   end
 
@@ -1439,7 +1419,7 @@ defmodule Connector do
       created_at: System.system_time(:second)
     }
 
-    Logger.debug("Connector init: #{inspect(state)}")
+    do_log(:debug, "initialized: #{inspect(state)}", state)
     {:ok, state, {:continue, :after_connect}}
   end
 
@@ -1457,11 +1437,11 @@ defmodule Connector do
       created_at: System.system_time(:second)
     }
 
-    Logger.debug("[gen_tcp] Connecting to #{inspect(state.peer_ip)}:#{inspect(state.peer_port)} ...")
+    do_log(:info, "[gen_tcp] connecting ...", state)
 
     case :gen_tcp.connect(state.peer_ip, state.peer_port, [:binary, active: true], 10000) do
       {:ok, socket} ->
-        Logger.info("[gen_tcp] Connected to #{inspect(state.peer_ip)}:#{state.peer_port}")
+        do_log(:info, "[gen_tcp] conected", state)
         s2 = %{state | socket: socket, peer_last_active_time: System.system_time(:second)}
         {:ok, s2, {:continue, :after_connect}}
       {:error, :timeout} ->
@@ -1536,7 +1516,7 @@ defmodule Connector do
 
   def handle_call(:enable_keepalive, _from, state) do
     send(self(), :keepalive)
-    Logger.debug("enable keepalive")
+    do_log(:debug, "enable_keepalive", state)
     {:reply, :ok, state}
   end
 
@@ -1548,15 +1528,12 @@ defmodule Connector do
     # Get chunk data from fileserver then send it to peer
 
     chunk_data =
-      GenServer.call(
-        state.fileserver_pid,
-        {:get_piece_chunk, piece_index, begin_offset, chunk_length}
-      )
+      GenServer.call(state.fileserver_pid, {:get_piece_chunk, piece_index, begin_offset, chunk_length})
 
     resp =
       case chunk_data do
         nil ->
-          Logger.warn("handle_call(:send_chunk): Chunk {} not found. Skipped.")
+          do_log(:warn, "[send_chunk] (skip) chunk ##{piece_index} not found", state)
           {:error, :chunk_not_found}
 
         _ ->
@@ -1601,15 +1578,15 @@ defmodule Connector do
 
   def handle_call({:request_piece, piece_index, begin_offset, chunk_length}, _from, state) do
     if state.am_choked === true do
-      Logger.debug("[CN] Skip request: I am choked !!")
+      do_log(:debug, "skip request: I am choked !!", state)
       me = self()
-      spawn(fn -> GenServer.call(me, {:send_msg, :interested}) end)
+      spawn_link(fn -> GenServer.call(me, {:send_msg, :interested}) end)
       {:reply, {:error, :i_am_choked}, state}
     else
       length_limit = PeerWireProtocol.max_piece_request_length()
 
       if chunk_length > length_limit do
-        Logger.warn("Requested chunk too large (#{chunk_length}), reduced to #{length_limit}")
+        do_log(:warn, "Requested chunk too large (#{chunk_length}), reduced to #{length_limit}", state)
         msg = PeerWireProtocol.encode(:request, piece_index, begin_offset, length_limit)
         :ok = send_binary_data_to_peer(msg, state.socket)
         {:reply, :ok, state}
@@ -1625,14 +1602,13 @@ defmodule Connector do
     case state.peer_extend_msg_mappings["ut_metadata"] do
       nil ->
         # Peer not supporting ut_metadata. Do-nothing.
-        Logger.debug("(skip) request_metadata_piece ##{piece_index}: peer not supprt ut_metadata")
-        :noop
+        do_log(:debug, "(skip) request_metadata_piece ##{piece_index}: peer not supprt ut_metadata", state)
       extend_msg_id ->
         # TODO: refactor
         data = %{"msg_type" => 0, "piece" => piece_index}
         raw_data = Bencoding.encode(data)
         bin_msg = PeerWireProtocol.encode(:extended, :raw, extend_msg_id, raw_data)
-        Logger.debug("request_metadata_piece ##{piece_index}")
+        do_log(:debug, "request_metadata_piece ##{piece_index}", state)
         :ok = send_binary_data_to_peer(bin_msg, state.socket)
     end
     {:reply, :ok, state}
@@ -1679,17 +1655,14 @@ defmodule Connector do
   end
 
   def handle_call({:send_msg, {:bitfield, bitfield}}, _from, state) when is_binary(bitfield) do
-    Logger.debug("[PeerWireProtocol - bitfield] send my bitfield #{inspect(bitfield)}")
+    do_log(:debug, "send my bitfield #{inspect(bitfield)}", state)
     msg = PeerWireProtocol.encode(:bitfield, bitfield)
     :ok = send_binary_data_to_peer(msg, state.socket)
     {:reply, :ok, state}
   end
 
   def handle_call({:send_msg, {:request, piece_index, begin_offset, chunk_length}}, _from, state) do
-    Logger.debug(
-      "[PeerWireProtocol - request] request piece #{piece_index} #{begin_offset} #{chunk_length}"
-    )
-
+    do_log(:debug, "send :request piece ##{piece_index} #{begin_offset} #{chunk_length}", state)
     msg = PeerWireProtocol.encode(:request, piece_index, begin_offset, chunk_length)
     :ok = send_binary_data_to_peer(msg, state.socket)
     {:reply, :ok, state}
@@ -1720,13 +1693,13 @@ defmodule Connector do
 
   def handle_call(msg, from, state) do
     msg = "Unknown handle_call msg: #{inspect(msg)} from: #{inspect(from)}"
-    Logger.error(msg)
+    do_log(:error, msg , state)
     {:reply, {:error, msg}, state}
   end
 
   def handle_cast({:received_msg, peer_msg}, state) do
     # Received peer message
-    Logger.debug("On received peer_msg #{inspect(peer_msg)}")
+    do_log(:debug, "On received peer_msg #{inspect(peer_msg)}", state)
     # update peer's last alive timestamp
     state2 = %{state | peer_last_active_time: System.system_time(:second)}
 
@@ -1752,7 +1725,7 @@ defmodule Connector do
 
       keepalive_msg = PeerWireProtocol.encode(:keepalive)
       :ok = send_binary_data_to_peer(keepalive_msg, state.socket)
-      Logger.debug("[Sent] :keepalive")
+      do_log(:debug, "sent :keepalive", state)
 
       timer =
         Process.send_after(
@@ -1768,8 +1741,7 @@ defmodule Connector do
 
   def handle_info({:tcp, _socket, packet}, state) do
     # Dealing with incoming TCP packets
-
-    Logger.debug("Incoming packet #{inspect(packet)}")
+    do_log(:debug, "Incoming packet #{inspect(packet)}", state)
 
     buffer =
       case state.raw_packet_received do
@@ -1779,18 +1751,16 @@ defmodule Connector do
 
     new_state = do_decode_tcp(%{state | raw_packet_received: buffer})
 
-    Logger.debug(
-      "Buffer remain: size #{byte_size(new_state.raw_packet_received)}, data #{
-        inspect(new_state.raw_packet_received)
-      }"
-    )
+
+    logmsg = "Buffer remain: size #{byte_size(new_state.raw_packet_received)}, data #{inspect(new_state.raw_packet_received)}"
+    do_log(:debug, logmsg, state)
 
     {:noreply, new_state}
   end
 
   def handle_info({:tcp_closed, socket}, state) do
     msg = "TCP Closed: #{inspect(:inet.peername(socket))}"
-    Logger.info(msg)
+    do_log(:info, msg, state)
     reason = {:tcp_closed, socket}
     {:stop, {:shutdown, reason}, state}
   end
@@ -1798,13 +1768,13 @@ defmodule Connector do
   def handle_info({:tcp_error, socket, reason}, state) do
     msg = "TCP Error: #{inspect(reason)}. socket = #{inspect(:inet.peername(socket))}"
 
-    Logger.error(msg)
+    do_log(:error, msg, state)
     reason = {:tcp_error, socket, reason}
     {:stop, reason, state}
   end
 
   def handle_info(msg, state) do
-    Logger.error("got unknown handle_info/2 msg #{inspect(msg)}")
+    do_log(:error, "got unknown handle_info/2 msg #{inspect(msg)}", state)
     {:noreply, state}
   end
 
@@ -1815,14 +1785,14 @@ defmodule Connector do
   def do_handshake(state) do
     info_hash = GenServer.call(state.fileserver_pid, :torrent_info_hash)
     msg = PeerWireProtocol.encode(:handshake, info_hash, state.my_p2p_id, state.support)
-    Logger.debug("Send handshake (HEX): #{Base.encode16(msg)}")
+    do_log(:debug, "Send handshake (HEX): #{Base.encode16(msg)}", state)
     :ok = send_binary_data_to_peer(msg, state.socket)
     %{state | sent_handshake: true}
   end
 
   def do_extension_handshake(state) do
     info = %{"m" => @my_extend_msg_mappings}
-    Logger.debug("Sending extension handshake: #{inspect(info)}")
+    do_log(:debug, "Sending extension handshake: #{inspect(info)}", state)
     msg = PeerWireProtocol.encode(:extended, :handshake, info)
     :ok = send_binary_data_to_peer(msg, state.socket)
     state
@@ -1836,7 +1806,7 @@ defmodule Connector do
   end
 
   def do_decode_tcp(state) do
-    Logger.debug("Checking tcp buffer: #{inspect(state.raw_packet_received)}")
+    do_log(:debug, "Checking tcp buffer: #{inspect(state.raw_packet_received)}", state)
 
     if not state.received_handshake do
       # 68: size of handshake message
@@ -1884,9 +1854,8 @@ defmodule Connector do
       # Verify INFO_HASH and PEER_ID
       info_hash !== state.torrent_data.info_hash ->
         {:stop,
-         "info_hash not matched: (theirs) #{inspect(info_hash)} vs. (mine) #{
-           inspect(state.torrent_data.info_hash)
-         }", state}
+         "info_hash not matched: (theirs) #{inspect(info_hash)} vs. (mine) #{inspect(state.torrent_data.info_hash)}",
+         state}
 
       # peer_id !== state.peer_id ->
       #     {:stop, "peer_id not matched: (theirs) #{inspect peer_id} vs. (mine) #{inspect state.peer_id}}", state}
@@ -1906,7 +1875,7 @@ defmodule Connector do
     end
   end
   def on_received_peer_msg({:extended, :raw, ext_msg_id, _ext_msg_body}=raw_msg, state) do
-    Logger.debug("Processing raw extended msg ##{ext_msg_id} #{inspect(raw_msg)} with mappings=#{inspect(state.peer_extend_msg_mappings)}")
+    do_log(:debug, "Processing raw extended msg ##{ext_msg_id} #{inspect(raw_msg)} with mappings=#{inspect(state.peer_extend_msg_mappings)}", state)
 
     ext_msg = if ext_msg_id == 0 do
       PeerWireProtocol.decode_extend(raw_msg, "handshake")
@@ -1916,7 +1885,7 @@ defmodule Connector do
       PeerWireProtocol.decode_extend(raw_msg, ext_msg_type)
     end
 
-    Logger.debug("Got ext msg #{inspect(ext_msg)}")
+    do_log(:debug, "Got ext msg #{inspect(ext_msg)}", state)
     if ext_msg == :not_supported do
       {:noreply, state}
     else
@@ -2040,7 +2009,7 @@ defmodule Connector do
     {:noreply, state}
   end
   def on_received_peer_msg(unknown_msg, state) do
-    Logger.warn("Ignored unknown peer message #{inspect(unknown_msg)}")
+    do_log(:warn, "Ignored unknown peer message #{inspect(unknown_msg)}", state)
     {:noreply, state}
   end
 
@@ -2399,7 +2368,7 @@ defmodule JobControl do
     my_p2p_id = :crypto.strong_rand_bytes(20) |> Base.encode64() |> binary_part(0, 20)
     # TODO: make it configureable
     listen_port = 8999
-    dht_port = 6881
+    dht_port = 0 # 0 means auto-assignment
     torrent_info_hash = GenServer.call(fileserver_pid, :torrent_info_hash)
     # {:ok, tracker_client_pid} = TrackerClient.start_link([my_p2p_id, listen_port, fileserver_pid])
     {:ok, peer_discovery_pid} = PeerDiscovery.start_link([my_p2p_id, torrent_info_hash, dht_port])
@@ -2890,30 +2859,6 @@ defmodule JobControl do
     planned_requests
   end
 
-  # def plan(i_need_pieces, they_have_pieces) do
-  #     pids = Enum.map(they_have_pieces, fn {pid, _index_list} -> pid end)
-  #     piece_and_owners = for piece_index <- i_need_pieces do
-  #         pid_list = for {pid, index_list} <- they_have_pieces, Enum.member?(index_list, piece_index) do
-  #             pid
-  #         end
-  #         {piece_index, pid_list}
-  #     end
-  #
-  #     # Rarest piece first
-  #     sorted = Enum.sort_by(resource_map,
-  #                          fn {_i, pid_list} ->  length(pid_list) end)
-  #     Enum.reduce_while(sorted, {[], pids},
-  #         fn ({piece_idx, pids}, {requests, free_pids}=acc) ->
-  #             if free_pids == [] do
-  #                 {:halt, acc}
-  #             else
-  #                 # intersect of free_pids and pids
-  #                 p_list = free_pids -- (free_pids -- pids)
-  #                 Enum.reduce_while(p_list, acc, fun)
-  #             end
-  #         end)
-  # end
-
   def cmd_serve_one_chunk(connector_pid) do
     # Tell connector to response to the peer's request, send 1 piece chunk to peer.
     # returns on of the folowing:
@@ -3000,6 +2945,7 @@ defmodule Listener do
     loop(listen_socket, job_control_pid)
   end
 end
+
 
 defmodule TrackerClient do
   use GenServer
@@ -3222,6 +3168,11 @@ defmodule Job do
     {:ok, control_pid} = JobControl.start_link(fs_pid)
     GenServer.call(fs_pid, {:set_event_manager, control_pid})
     control_pid
+  end
+
+  def close(job_control) do
+    stop(job_control)
+    GenServer.stop(job_control)
   end
 
   def start(job_control) do
@@ -3712,10 +3663,6 @@ defmodule KRPC_Msg do
   end
 
   def ping(sender_id) do
-    # ping Query = {"t":"aa", "y":"q", "q":"ping", "a":{"id":"abcdefghij0123456789"}}
-    # bencoded = d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe
-    # Response = {"t":"aa", "y":"r", "r": {"id":"mnopqrstuvwxyz123456"}}
-    # bencoded = d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re
     query_args = %{"id" => sender_id}
     %{"t" => gen_transaction_id(), "y" => "q", "q" => "ping", "a" => query_args}
   end
@@ -3769,6 +3716,7 @@ end
 defmodule TokenServer do
   # Provodes tokens for the KRPC's secret_length/announce_peer methods
   use GenServer
+  require Logger
 
   @token_expire_time 5 * 60 * 1000
   @secret_length 8
@@ -3778,15 +3726,8 @@ defmodule TokenServer do
     :old_secret
   ]
 
-  def start_link(init_args, debug \\ false) do
-    opts =
-      if debug == true do
-        [debug: [:statistics, :trace]]
-      else
-        []
-      end
-
-    GenServer.start_link(__MODULE__, init_args, opts)
+  def start_link(init_args) do
+    GenServer.start_link(__MODULE__, init_args)
   end
 
   def init([]) do
@@ -3825,6 +3766,7 @@ defmodule TokenServer do
   end
 
   def handle_info(:loop_renew_secret, state) do
+    Logger.info("[TokenServer] Renew secret")
     new_state = %{state | old_secret: state.secret, secret: random_secret()}
     Process.send_after(self(), :loop_renew_secret, @token_expire_time)
     {:noreply, new_state}
@@ -3848,26 +3790,12 @@ defmodule DHTServer do
     :waiting_response
   ]
 
-  def start(init_args, debug \\ false) do
-    opts =
-      if debug == true do
-        [debug: [:statistics, :trace]]
-      else
-        []
-      end
-
-    GenServer.start(__MODULE__, init_args, opts)
+  def start(init_args) do
+    GenServer.start(__MODULE__, init_args)
   end
 
-  def start_link(init_args, debug \\ false) do
-    opts =
-      if debug == true do
-        [debug: [:statistics, :trace]]
-      else
-        []
-      end
-
-    GenServer.start_link(__MODULE__, init_args, opts)
+  def start_link(init_args) do
+    GenServer.start_link(__MODULE__, init_args)
   end
 
   def init([node_id, port]) do
@@ -3913,6 +3841,7 @@ defmodule DHTServer do
 
   def search_peers(pid, info_hash) do
     # -> {:ok, <list of peers>} or {:error, <reason>}
+    Logger.info("[DHTServer] Searching peers of info_hash #{inspect(info_hash)}")
     if bit_size(info_hash) != 160 do
       {:error, "Invalid size of info_hash"}
     else
@@ -3920,6 +3849,7 @@ defmodule DHTServer do
       Logger.debug("[search_peers] picked neighbor_nodes #{inspect(neighbor_nodes)}")
       acc = {neighbor_nodes, [], []}
       peers = search_peers(pid, info_hash, acc)
+      Logger.info("[DHTServer] Search peers: got peers #{inspect(peers)}")
       {:ok, peers}
     end
   end
@@ -4014,15 +3944,13 @@ defmodule DHTServer do
           [{:timeout, @api_search_nodes_timeout}]
         )
         |> Enum.to_list()
-        |> List.foldl(
-          [],
-          fn x, acc ->
-            case x do
-              {:ok, nodes} -> nodes ++ acc
-              _ -> acc
-            end
-          end
-        )
+        |> List.foldl([],
+                      fn x, acc ->
+                        case x do
+                          {:ok, nodes} -> nodes ++ acc
+                          _ -> acc
+                        end
+                      end)
 
       # Enum.each(new_nodes, fn x -> add_node(pid) end)
       Logger.debug("[search_nodes] new_nodes: #{inspect(new_nodes)}")
@@ -4131,14 +4059,14 @@ defmodule DHTServer do
           Logger.error("[bootstrap] failed to find_node: #{inspect(reason)}")
 
         nodes ->
-          Logger.info("[bootstrap] got nodes from bootstrap node: #{inspect(nodes)}")
+          Logger.debug("[bootstrap] got nodes from bootstrap node: #{inspect(nodes)}")
 
           Enum.each(nodes, fn x ->
-            GenServer.call(this, {:add_node, x.id, x.ip, x.port}, :infinity)
-          end)
+                             GenServer.call(this, {:add_node, x.id, x.ip, x.port}, :infinity)
+                           end)
 
           res = search_nodes(this, state.node_id)
-          Logger.info("[bootstrap] result: #{inspect(res)}")
+          Logger.debug("[bootstrap] result: #{inspect(res)}")
       end
     end)
 
@@ -4213,12 +4141,7 @@ defmodule DHTServer do
         {:noreply, state}
 
       {{req, req_pid}, m} ->
-        Logger.warn(
-          "krpc_query_timeout: delete #{inspect(transaction_id)} from waiting queue: #{
-            inspect(req)
-          }"
-        )
-
+        Logger.warn("krpc_query_timeout: delete #{inspect(transaction_id)} from waiting queue: #{inspect(req)}")
         GenServer.reply(req_pid, {:error, :response_timeout})
         new_state = %{state | waiting_response: m}
         {:noreply, new_state}
@@ -4402,9 +4325,7 @@ defmodule DHTServer do
     if Map.has_key?(state.waiting_response, transaction_id) do
       {{req, from_pid}, rest_waiting} = Map.pop(state.waiting_response, transaction_id)
       new_state = %{state | waiting_response: rest_waiting}
-      Logger.warn(
-        "[KRPC-error] #{inspect(ip)}:#{port} request: #{inspect(req)}. error: #{inspect(msg_error)}"
-      )
+      Logger.warn("[KRPC-error] #{inspect(ip)}:#{port} request: #{inspect(req)}. error: #{inspect(msg_error)}")
       GenServer.reply(from_pid, {:error, {err_code, err_msg}})
       new_state
     else
@@ -4565,10 +4486,17 @@ defmodule PeerDiscovery do
 
 end
 
+if System.get_env("DEBUG") do
+  Logger.configure(level: :debug)
+else
+  Logger.configure(level: :info)
+end
+
+
 IO.puts("======== Running Tests ==========")
 Bencoding.test_all()
 FileServer.test_all()
 Connector.test_all()
 Job.test_all()
 Job.check_requirements()
-IO.puts("======== all test passed ========")
+IO.puts("======== All Test Passed ========")
